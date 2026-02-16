@@ -2726,7 +2726,7 @@ static void VULKAN_INTERNAL_TextureMemoryBarrier(
         memoryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         memoryBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     } else if (sourceUsageMode == VULKAN_TEXTURE_USAGE_MODE_SAMPLER) {
-        srcStages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        srcStages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
         memoryBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     } else if (sourceUsageMode == VULKAN_TEXTURE_USAGE_MODE_GRAPHICS_STORAGE_READ) {
@@ -2763,7 +2763,7 @@ static void VULKAN_INTERNAL_TextureMemoryBarrier(
         memoryBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         memoryBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     } else if (destinationUsageMode == VULKAN_TEXTURE_USAGE_MODE_SAMPLER) {
-        dstStages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        dstStages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         memoryBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     } else if (destinationUsageMode == VULKAN_TEXTURE_USAGE_MODE_GRAPHICS_STORAGE_READ) {
@@ -9220,6 +9220,77 @@ static void VULKAN_CopyBufferToBuffer(
     VULKAN_INTERNAL_TrackBuffer(vulkanCommandBuffer, dstBuffer);
     VULKAN_INTERNAL_TrackBufferTransfer(vulkanCommandBuffer, srcContainer->activeBuffer);
     VULKAN_INTERNAL_TrackBufferTransfer(vulkanCommandBuffer, dstBuffer);
+
+    SDL_UnlockRWLock(renderer->defragLock);
+}
+
+static void VULKAN_CopyBufferToTexture(
+    SDL_GPUCommandBuffer *commandBuffer,
+    const SDL_GPUBufferTextureCopyInfo *source,
+    const SDL_GPUTextureRegion *destination,
+    bool cycle)
+{
+    VulkanCommandBuffer *vulkanCommandBuffer = (VulkanCommandBuffer *)commandBuffer;
+    VulkanRenderer *renderer = vulkanCommandBuffer->renderer;
+    VulkanBufferContainer *srcContainer = (VulkanBufferContainer *)source->buffer;
+    VulkanTextureSubresource *dstSubresource;
+    VkBufferImageCopy imageCopy;
+
+    SDL_LockRWLockForReading(renderer->defragLock);
+
+    dstSubresource = VULKAN_INTERNAL_PrepareTextureSubresourceForWrite(
+        renderer,
+        vulkanCommandBuffer,
+        (VulkanTextureContainer *)destination->texture,
+        destination->layer,
+        destination->mip_level,
+        cycle,
+        VULKAN_TEXTURE_USAGE_MODE_COPY_DESTINATION);
+
+    VULKAN_INTERNAL_BufferTransitionFromDefaultUsage(
+        renderer,
+        vulkanCommandBuffer,
+        VULKAN_BUFFER_USAGE_MODE_COPY_SOURCE,
+        srcContainer->activeBuffer);
+
+    imageCopy.imageExtent.width = destination->w;
+    imageCopy.imageExtent.height = destination->h;
+    imageCopy.imageExtent.depth = destination->d;
+    imageCopy.imageOffset.x = destination->x;
+    imageCopy.imageOffset.y = destination->y;
+    imageCopy.imageOffset.z = destination->z;
+    imageCopy.imageSubresource.aspectMask = dstSubresource->parent->aspectFlags;
+    imageCopy.imageSubresource.baseArrayLayer = destination->layer;
+    imageCopy.imageSubresource.layerCount = 1;
+    imageCopy.imageSubresource.mipLevel = destination->mip_level;
+    imageCopy.bufferOffset = source->offset;
+    imageCopy.bufferRowLength = source->pixels_per_row;
+    imageCopy.bufferImageHeight = source->rows_per_layer;
+
+    renderer->vkCmdCopyBufferToImage(
+        vulkanCommandBuffer->commandBuffer,
+        srcContainer->activeBuffer->buffer,
+        dstSubresource->parent->image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &imageCopy);
+
+    VULKAN_INTERNAL_BufferTransitionToDefaultUsage(
+        renderer,
+        vulkanCommandBuffer,
+        VULKAN_BUFFER_USAGE_MODE_COPY_SOURCE,
+        srcContainer->activeBuffer);
+
+    VULKAN_INTERNAL_TextureSubresourceTransitionToDefaultUsage(
+        renderer,
+        vulkanCommandBuffer,
+        VULKAN_TEXTURE_USAGE_MODE_COPY_DESTINATION,
+        dstSubresource);
+
+    VULKAN_INTERNAL_TrackBuffer(vulkanCommandBuffer, srcContainer->activeBuffer);
+    VULKAN_INTERNAL_TrackTexture(vulkanCommandBuffer, dstSubresource->parent);
+    VULKAN_INTERNAL_TrackBufferTransfer(vulkanCommandBuffer, srcContainer->activeBuffer);
+    VULKAN_INTERNAL_TrackTextureTransfer(vulkanCommandBuffer, dstSubresource->parent);
 
     SDL_UnlockRWLock(renderer->defragLock);
 }
