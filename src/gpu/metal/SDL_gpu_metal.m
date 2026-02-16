@@ -1930,6 +1930,44 @@ static void METAL_CopyBufferToBuffer(
     }
 }
 
+static void METAL_CopyBufferToTexture(
+    SDL_GPUCommandBuffer *commandBuffer,
+    const SDL_GPUBufferTextureCopyInfo *source,
+    const SDL_GPUTextureRegion *destination,
+    bool cycle)
+{
+    @autoreleasepool {
+        MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
+        MetalRenderer *renderer = metalCommandBuffer->renderer;
+        MetalBufferContainer *bufferContainer = (MetalBufferContainer *)source->buffer;
+        MetalTextureContainer *textureContainer = (MetalTextureContainer *)destination->texture;
+        Uint32 pixelsPerRow = source->pixels_per_row ? source->pixels_per_row : destination->w;
+        Uint32 rowsPerLayer = source->rows_per_layer ? source->rows_per_layer : destination->h;
+        Uint32 bytesPerRow = BytesPerRow(pixelsPerRow, textureContainer->header.info.format);
+        Uint32 bytesPerImage = SDL_CalculateGPUTextureFormatSize(
+            textureContainer->header.info.format,
+            pixelsPerRow,
+            rowsPerLayer,
+            1);
+
+        MetalTexture *metalTexture = METAL_INTERNAL_PrepareTextureForWrite(renderer, textureContainer, cycle);
+
+        [metalCommandBuffer->blitEncoder
+                 copyFromBuffer:bufferContainer->activeBuffer->handle
+                   sourceOffset:source->offset
+              sourceBytesPerRow:bytesPerRow
+            sourceBytesPerImage:bytesPerImage
+                     sourceSize:MTLSizeMake(destination->w, destination->h, destination->d)
+                      toTexture:metalTexture->handle
+               destinationSlice:destination->layer
+               destinationLevel:destination->mip_level
+              destinationOrigin:MTLOriginMake(destination->x, destination->y, destination->z)];
+
+        METAL_INTERNAL_TrackTexture(metalCommandBuffer, metalTexture);
+        METAL_INTERNAL_TrackBuffer(metalCommandBuffer, bufferContainer->activeBuffer);
+    }
+}
+
 static void METAL_DownloadFromTexture(
     SDL_GPUCommandBuffer *commandBuffer,
     const SDL_GPUTextureRegion *source,

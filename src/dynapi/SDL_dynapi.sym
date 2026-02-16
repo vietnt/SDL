@@ -73,6 +73,7 @@ SDL3_0.0.0 {
     SDL_ConvertSurfaceAndColorspace;
     SDL_CopyFile;
     SDL_CopyGPUBufferToBuffer;
+    SDL_CopyGPUBufferToTexture;
     SDL_CopyGPUTextureToTexture;
     SDL_CopyProperties;
     SDL_CopyStorageFile;

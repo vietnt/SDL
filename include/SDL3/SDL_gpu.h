@@ -1419,6 +1419,23 @@ typedef struct SDL_GPUTextureTransferInfo
 } SDL_GPUTextureTransferInfo;
 
 /**
+ * A structure specifying a buffer source for a texture copy.
+ *
+ * Used by SDL_CopyGPUBufferToTexture.
+ *
+ * \since This struct is available since SDL 3.4.0.
+ *
+ * \sa SDL_CopyGPUBufferToTexture
+ */
+typedef struct SDL_GPUBufferTextureCopyInfo
+{
+    SDL_GPUBuffer *buffer;  /**< The buffer to copy from. */
+    Uint32 offset;          /**< The starting byte offset in the buffer. */
+    Uint32 pixels_per_row;  /**< The number of pixels from one row to the next. 0 = tightly packed from destination width. */
+    Uint32 rows_per_layer;  /**< The number of rows from one layer/depth-slice to the next. 0 = tightly packed from destination height. */
+} SDL_GPUBufferTextureCopyInfo;
+
+/**
  * A structure specifying a location in a transfer buffer.
  *
  * Used when transferring buffer data to or from a transfer buffer.
@@ -3967,6 +3984,26 @@ extern SDL_DECLSPEC void SDLCALL SDL_CopyGPUTextureToTexture(
     Uint32 w,
     Uint32 h,
     Uint32 d,
+    bool cycle);
+
+/**
+ * Performs a buffer-to-texture copy.
+ *
+ * This copy occurs on the GPU timeline. You may assume the copy has finished
+ * in subsequent commands.
+ *
+ * \param copy_pass a copy pass handle.
+ * \param source the source buffer and layout info.
+ * \param destination the destination texture region.
+ * \param cycle if true, cycles the destination texture if it is already
+ *              bound, otherwise overwrites the data.
+ *
+ * \since This function is available since SDL 3.4.0.
+ */
+extern SDL_DECLSPEC void SDLCALL SDL_CopyGPUBufferToTexture(
+    SDL_GPUCopyPass *copy_pass,
+    const SDL_GPUBufferTextureCopyInfo *source,
+    const SDL_GPUTextureRegion *destination,
     bool cycle);
 
 /**

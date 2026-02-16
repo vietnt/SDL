@@ -2947,6 +2947,44 @@ void SDL_CopyGPUBufferToBuffer(
         cycle);
 }
 
+void SDL_CopyGPUBufferToTexture(
+    SDL_GPUCopyPass *copy_pass,
+    const SDL_GPUBufferTextureCopyInfo *source,
+    const SDL_GPUTextureRegion *destination,
+    bool cycle)
+{
+    CHECK_PARAM(copy_pass == NULL) {
+        SDL_InvalidParamError("copy_pass");
+        return;
+    }
+    CHECK_PARAM(source == NULL) {
+        SDL_InvalidParamError("source");
+        return;
+    }
+    CHECK_PARAM(destination == NULL) {
+        SDL_InvalidParamError("destination");
+        return;
+    }
+
+    if (COPYPASS_DEVICE->debug_mode) {
+        CHECK_COPYPASS
+        if (source->buffer == NULL) {
+            SDL_assert_release(!"Source buffer cannot be NULL!");
+            return;
+        }
+        if (destination->texture == NULL) {
+            SDL_assert_release(!"Destination texture cannot be NULL!");
+            return;
+        }
+    }
+
+    COPYPASS_DEVICE->CopyBufferToTexture(
+        COPYPASS_COMMAND_BUFFER,
+        source,
+        destination,
+        cycle);
+}
+
 void SDL_DownloadFromGPUTexture(
     SDL_GPUCopyPass *copy_pass,
     const SDL_GPUTextureRegion *source,

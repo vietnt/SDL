@@ -6305,6 +6305,206 @@ static void D3D12_CopyBufferToBuffer(
     D3D12_INTERNAL_TrackBuffer(d3d12CommandBuffer, destinationBuffer);
 }
 
+static void D3D12_CopyBufferToTexture(
+    SDL_GPUCommandBuffer *commandBuffer,
+    const SDL_GPUBufferTextureCopyInfo *source,
+    const SDL_GPUTextureRegion *destination,
+    bool cycle)
+{
+    D3D12CommandBuffer *d3d12CommandBuffer = (D3D12CommandBuffer *)commandBuffer;
+    D3D12Renderer *renderer = d3d12CommandBuffer->renderer;
+    D3D12BufferContainer *sourceContainer = (D3D12BufferContainer *)source->buffer;
+    D3D12TextureContainer *textureContainer = (D3D12TextureContainer *)destination->texture;
+    D3D12Buffer *sourceBuffer = sourceContainer->activeBuffer;
+    D3D12Buffer *temporaryBuffer = NULL;
+    D3D12_TEXTURE_COPY_LOCATION sourceLocation;
+    D3D12_TEXTURE_COPY_LOCATION destinationLocation;
+    Uint32 pixelsPerRow = source->pixels_per_row;
+    Uint32 rowsPerSlice = source->rows_per_layer;
+    Uint32 rowPitch;
+    Uint32 destinationRowPitch;
+    Uint32 alignedRowPitch;
+    Uint32 blockHeight;
+    Uint32 sourceBlockRows;
+    Uint32 destinationBlockRows;
+    Uint32 bytesPerSlice;
+    Uint32 alignedBytesPerSlice;
+    bool needsRealignment;
+    bool needsPlacementCopy;
+    D3D12TextureSubresource *textureSubresource = D3D12_INTERNAL_PrepareTextureSubresourceForWrite(
+        d3d12CommandBuffer,
+        textureContainer,
+        destination->layer,
+        destination->mip_level,
+        cycle,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+
+    if (pixelsPerRow == 0) {
+        pixelsPerRow = destination->w;
+    }
+
+    if (rowsPerSlice == 0) {
+        rowsPerSlice = destination->h;
+    }
+
+    rowPitch = BytesPerRow(pixelsPerRow, textureContainer->header.info.format);
+    destinationRowPitch = BytesPerRow(destination->w, textureContainer->header.info.format);
+    blockHeight = Texture_GetBlockHeight(textureContainer->header.info.format);
+    sourceBlockRows = (rowsPerSlice + (blockHeight - 1)) / blockHeight;
+    destinationBlockRows = (destination->h + (blockHeight - 1)) / blockHeight;
+    bytesPerSlice = sourceBlockRows * rowPitch;
+
+    if (renderer->UnrestrictedBufferTextureCopyPitchSupported) {
+        alignedRowPitch = rowPitch;
+        needsRealignment = false;
+        needsPlacementCopy = false;
+    } else {
+        alignedRowPitch = destinationRowPitch;
+        alignedRowPitch = D3D12_INTERNAL_Align(alignedRowPitch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+        needsRealignment = rowsPerSlice != destination->h || rowPitch != alignedRowPitch;
+        needsPlacementCopy = source->offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT != 0;
+    }
+
+    alignedBytesPerSlice = destinationBlockRows * alignedRowPitch;
+
+    sourceLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    sourceLocation.PlacedFootprint.Footprint.Format = SDLToD3D12_TextureFormat[textureContainer->header.info.format];
+    sourceLocation.PlacedFootprint.Footprint.RowPitch = alignedRowPitch;
+
+    destinationLocation.pResource = textureSubresource->parent->resource;
+    destinationLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destinationLocation.SubresourceIndex = textureSubresource->index;
+
+    D3D12_INTERNAL_BufferTransitionFromDefaultUsage(
+        d3d12CommandBuffer,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        sourceBuffer);
+
+    if (needsRealignment || needsPlacementCopy) {
+        temporaryBuffer = D3D12_INTERNAL_CreateBuffer(
+            renderer,
+            0,
+            alignedBytesPerSlice * destination->d,
+            D3D12_BUFFER_TYPE_GPU,
+            NULL);
+
+        if (!temporaryBuffer) {
+            D3D12_INTERNAL_BufferTransitionToDefaultUsage(
+                d3d12CommandBuffer,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                sourceBuffer);
+            return;
+        }
+
+        D3D12_INTERNAL_ResourceBarrier(
+            d3d12CommandBuffer,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            temporaryBuffer->handle,
+            0,
+            false);
+
+        if (needsRealignment) {
+            for (Uint32 sliceIndex = 0; sliceIndex < destination->d; sliceIndex += 1) {
+                for (Uint32 rowIndex = 0; rowIndex < destinationBlockRows; rowIndex += 1) {
+                    ID3D12GraphicsCommandList_CopyBufferRegion(
+                        d3d12CommandBuffer->graphicsCommandList,
+                        temporaryBuffer->handle,
+                        (sliceIndex * alignedBytesPerSlice) + (rowIndex * alignedRowPitch),
+                        sourceBuffer->handle,
+                        source->offset + (sliceIndex * bytesPerSlice) + (rowIndex * rowPitch),
+                        destinationRowPitch);
+                }
+            }
+        } else {
+            ID3D12GraphicsCommandList_CopyBufferRegion(
+                d3d12CommandBuffer->graphicsCommandList,
+                temporaryBuffer->handle,
+                0,
+                sourceBuffer->handle,
+                source->offset,
+                alignedBytesPerSlice * destination->d);
+        }
+
+        D3D12_INTERNAL_ResourceBarrier(
+            d3d12CommandBuffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            temporaryBuffer->handle,
+            0,
+            false);
+
+        sourceLocation.pResource = temporaryBuffer->handle;
+
+        if (needsRealignment) {
+            for (Uint32 sliceIndex = 0; sliceIndex < destination->d; sliceIndex += 1) {
+                sourceLocation.PlacedFootprint.Offset = sliceIndex * alignedBytesPerSlice;
+                sourceLocation.PlacedFootprint.Footprint.Width = destination->w;
+                sourceLocation.PlacedFootprint.Footprint.Height = destination->h;
+                sourceLocation.PlacedFootprint.Footprint.Depth = 1;
+
+                ID3D12GraphicsCommandList_CopyTextureRegion(
+                    d3d12CommandBuffer->graphicsCommandList,
+                    &destinationLocation,
+                    destination->x,
+                    destination->y,
+                    destination->z + sliceIndex,
+                    &sourceLocation,
+                    NULL);
+            }
+        } else {
+            sourceLocation.PlacedFootprint.Offset = 0;
+            sourceLocation.PlacedFootprint.Footprint.Width = destination->w;
+            sourceLocation.PlacedFootprint.Footprint.Height = destination->h;
+            sourceLocation.PlacedFootprint.Footprint.Depth = destination->d;
+
+            ID3D12GraphicsCommandList_CopyTextureRegion(
+                d3d12CommandBuffer->graphicsCommandList,
+                &destinationLocation,
+                destination->x,
+                destination->y,
+                destination->z,
+                &sourceLocation,
+                NULL);
+        }
+
+        D3D12_INTERNAL_TrackBuffer(d3d12CommandBuffer, temporaryBuffer);
+        D3D12_INTERNAL_ReleaseBuffer(renderer, temporaryBuffer);
+
+        if (renderer->debug_mode && needsPlacementCopy && !needsRealignment) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "Buffer-to-texture copy offset not aligned to 512 bytes! This is suboptimal on D3D12!");
+        }
+    } else {
+        sourceLocation.pResource = sourceBuffer->handle;
+        sourceLocation.PlacedFootprint.Offset = source->offset;
+        sourceLocation.PlacedFootprint.Footprint.Width = destination->w;
+        sourceLocation.PlacedFootprint.Footprint.Height = destination->h;
+        sourceLocation.PlacedFootprint.Footprint.Depth = destination->d;
+
+        ID3D12GraphicsCommandList_CopyTextureRegion(
+            d3d12CommandBuffer->graphicsCommandList,
+            &destinationLocation,
+            destination->x,
+            destination->y,
+            destination->z,
+            &sourceLocation,
+            NULL);
+    }
+
+    D3D12_INTERNAL_TextureSubresourceTransitionToDefaultUsage(
+        d3d12CommandBuffer,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        textureSubresource);
+
+    D3D12_INTERNAL_BufferTransitionToDefaultUsage(
+        d3d12CommandBuffer,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        sourceBuffer);
+
+    D3D12_INTERNAL_TrackBuffer(d3d12CommandBuffer, sourceBuffer);
+    D3D12_INTERNAL_TrackTexture(d3d12CommandBuffer, textureSubresource->parent);
+}
+
 static void D3D12_DownloadFromTexture(
     SDL_GPUCommandBuffer *commandBuffer,
     const SDL_GPUTextureRegion *source,

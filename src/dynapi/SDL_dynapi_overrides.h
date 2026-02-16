@@ -98,6 +98,7 @@
 #define SDL_ConvertSurfaceAndColorspace SDL_ConvertSurfaceAndColorspace_REAL
 #define SDL_CopyFile SDL_CopyFile_REAL
 #define SDL_CopyGPUBufferToBuffer SDL_CopyGPUBufferToBuffer_REAL
+#define SDL_CopyGPUBufferToTexture SDL_CopyGPUBufferToTexture_REAL
 #define SDL_CopyGPUTextureToTexture SDL_CopyGPUTextureToTexture_REAL
 #define SDL_CopyProperties SDL_CopyProperties_REAL
 #define SDL_CopyStorageFile SDL_CopyStorageFile_REAL

@@ -119,6 +119,7 @@ SDL_DYNAPI_PROC(SDL_Surface*,SDL_ConvertSurface,(SDL_Surface *a, SDL_PixelFormat
 SDL_DYNAPI_PROC(SDL_Surface*,SDL_ConvertSurfaceAndColorspace,(SDL_Surface *a, SDL_PixelFormat b, SDL_Palette *c, SDL_Colorspace d, SDL_PropertiesID e),(a,b,c,d,e),return)
 SDL_DYNAPI_PROC(bool,SDL_CopyFile,(const char *a, const char *b),(a,b),return)
 SDL_DYNAPI_PROC(void,SDL_CopyGPUBufferToBuffer,(SDL_GPUCopyPass *a, const SDL_GPUBufferLocation *b, const SDL_GPUBufferLocation *c, Uint32 d, bool e),(a,b,c,d,e),)
+SDL_DYNAPI_PROC(void,SDL_CopyGPUBufferToTexture,(SDL_GPUCopyPass *a, const SDL_GPUBufferTextureCopyInfo *b, const SDL_GPUTextureRegion *c, bool d),(a,b,c,d),)
 SDL_DYNAPI_PROC(void,SDL_CopyGPUTextureToTexture,(SDL_GPUCopyPass *a, const SDL_GPUTextureLocation *b, const SDL_GPUTextureLocation *c, Uint32 d, Uint32 e, Uint32 f, bool g),(a,b,c,d,e,f,g),)
 SDL_DYNAPI_PROC(bool,SDL_CopyProperties,(SDL_PropertiesID a, SDL_PropertiesID b),(a,b),return)
 SDL_DYNAPI_PROC(bool,SDL_CopyStorageFile,(SDL_Storage *a, const char *b, const char *c),(a,b,c),return)
