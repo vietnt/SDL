@@ -4059,6 +4059,7 @@ static bool METAL_INTERNAL_CreateSwapchain(
 
     // Set up the texture container
     SDL_zero(windowData->textureContainer);
+    windowData->textureContainer.renderer = renderer;
     windowData->textureContainer.canBeCycled = 0;
     windowData->textureContainer.activeTexture = &windowData->texture;
     windowData->textureContainer.textureCapacity = 1;
