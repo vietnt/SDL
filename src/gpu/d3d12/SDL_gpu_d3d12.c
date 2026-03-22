@@ -130,6 +130,7 @@
 #define VIEW_GPU_DESCRIPTOR_COUNT             65536
 #define SAMPLER_GPU_DESCRIPTOR_COUNT          2048
 #define STAGING_HEAP_DESCRIPTOR_COUNT         1024
+#define D3D12_TIMING_MAX_TIMED_COMMAND_LISTS_PER_FRAME 1024
 
 #define SDL_GPU_SHADERSTAGE_COMPUTE (SDL_GPUShaderStage)2
 
@@ -174,6 +175,7 @@ static const IID D3D_IID_ID3D12Device = { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x
 static const IID D3D_IID_ID3D12CommandQueue = { 0x0ec870a6, 0x5d7e, 0x4c22, { 0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed } };
 static const IID D3D_IID_ID3D12DescriptorHeap = { 0x8efb471d, 0x616c, 0x4f49, { 0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51 } };
 static const IID D3D_IID_ID3D12Resource = { 0x696442be, 0xa72e, 0x4059, { 0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad } };
+static const IID D3D_IID_ID3D12QueryHeap = { 0x0d9658ae, 0xed45, 0x469e, { 0xa6, 0x1d, 0x97, 0x0e, 0xd5, 0xc7, 0x5b, 0xa2 } };
 static const IID D3D_IID_ID3D12CommandAllocator = { 0x6102dee4, 0xaf59, 0x4b09, { 0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24 } };
 static const IID D3D_IID_ID3D12CommandList = { 0x7116d91c, 0xe7e4, 0x47ce, { 0xb8, 0xc6, 0xec, 0x81, 0x68, 0xf4, 0x37, 0xe5 } };
 static const IID D3D_IID_ID3D12GraphicsCommandList = { 0x5b160d0f, 0xac1b, 0x4185, { 0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55 } };
@@ -771,6 +773,21 @@ typedef struct D3D12Fence
     SDL_AtomicInt referenceCount;
 } D3D12Fence;
 
+typedef struct D3D12TimingSample
+{
+    Uint64 sampleID;
+    SDL_GPUCommandBufferTimingStatus status;
+    SDL_GPUTimeDomain timeDomain;
+    Uint64 durationNS;
+    Uint64 deviceGeneration;
+    Uint64 frameID;
+    Uint64 submitSerial;
+    Uint32 queryPairIndex;
+    D3D12Fence *fence;
+    bool submitted;
+    bool queryReserved;
+} D3D12TimingSample;
+
 struct D3D12DescriptorHeap
 {
     ID3D12DescriptorHeap *handle;
@@ -991,6 +1008,24 @@ struct D3D12Renderer
     Uint32 availableFenceCount;
     Uint32 availableFenceCapacity;
 
+    ID3D12QueryHeap *timingQueryHeap;
+    ID3D12Resource *timingReadbackBuffer;
+    Uint64 *timingReadbackMap;
+    Uint32 *timingFreeQueryPairs;
+    Uint32 timingFreeQueryPairCount;
+    Uint32 timingQueryPairCapacity;
+    D3D12TimingSample *timingSamples;
+    Uint32 timingSampleCount;
+    Uint32 timingSampleCapacity;
+    Uint64 timingSampleIDCounter;
+    Uint64 timingSubmitSerial;
+    Uint64 timingFrameIDCounter;
+    Uint64 timingFrequency;
+    Uint64 timingDeviceGeneration;
+    Uint32 timingMaxLatencyFrames;
+    Uint32 timingMaxTimedCommandListsPerFrame;
+    SDL_Mutex *timingLock;
+
     D3D12StagingDescriptorPool *stagingDescriptorPools[D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES];
     D3D12GPUDescriptorHeapPool gpuDescriptorHeapPools[2];
 
@@ -1044,6 +1079,8 @@ struct D3D12CommandBuffer
     ID3D12GraphicsCommandList *graphicsCommandList;
     D3D12Fence *inFlightFence;
     bool autoReleaseFence;
+    Uint32 timingQueryPairIndex;
+    bool timingQueryReserved;
 
     // Presentation data
     D3D12PresentData *presentDatas;
@@ -1273,13 +1310,137 @@ struct D3D12UniformBuffer
 static void D3D12_ReleaseWindow(SDL_GPURenderer *driverData, SDL_Window *window);
 static bool D3D12_Wait(SDL_GPURenderer *driverData);
 static bool D3D12_WaitForFences(SDL_GPURenderer *driverData, bool waitAll, SDL_GPUFence *const *fences, Uint32 numFences);
+static void D3D12_ReleaseFence(SDL_GPURenderer *driverData, SDL_GPUFence *fence);
 static void D3D12_INTERNAL_ReleaseBlitPipelines(SDL_GPURenderer *driverData);
+static bool D3D12_AcquireTimedCommandBuffer(SDL_GPUCommandBuffer *commandBuffer, Uint64 *sampleID);
+static bool D3D12_BeginCommandBufferTimingFrame(SDL_GPURenderer *driverData, Uint64 *outFrameID);
+static bool D3D12_SetCommandBufferTimingConfig(SDL_GPURenderer *driverData, const SDL_GPUCommandBufferTimingConfig *config);
+static bool D3D12_GetCommandBufferTimingConfig(SDL_GPURenderer *driverData, SDL_GPUCommandBufferTimingConfig *config);
+static bool D3D12_GetCommandBufferTimingCapabilities(SDL_GPURenderer *driverData, SDL_GPUCommandBufferTimingCapabilities *capabilities);
+static bool D3D12_GetCommandBufferTimingDeviceGeneration(SDL_GPURenderer *driverData, Uint64 *outDeviceGeneration);
+static bool D3D12_PollCommandBufferTiming(SDL_GPURenderer *driverData, SDL_GPUCommandBufferTimingResult *results, Uint32 maxResults, Uint32 *outResultCount);
 
 // Helpers
 
 static Uint32 D3D12_INTERNAL_Align(Uint32 location, Uint32 alignment)
 {
     return (location + (alignment - 1)) & ~(alignment - 1);
+}
+
+static bool D3D12_INTERNAL_EnsureTimingSampleCapacity(
+    D3D12Renderer *renderer,
+    Uint32 requiredCount)
+{
+    if (requiredCount <= renderer->timingSampleCapacity) {
+        return true;
+    }
+
+    Uint32 newCapacity = renderer->timingSampleCapacity == 0 ? 16 : renderer->timingSampleCapacity;
+    while (newCapacity < requiredCount) {
+        newCapacity *= 2;
+    }
+
+    D3D12TimingSample *resized = (D3D12TimingSample *)SDL_realloc(
+        renderer->timingSamples,
+        sizeof(D3D12TimingSample) * newCapacity);
+
+    if (resized == NULL) {
+        return SDL_OutOfMemory();
+    }
+
+    renderer->timingSamples = resized;
+    renderer->timingSampleCapacity = newCapacity;
+    return true;
+}
+
+static bool D3D12_INTERNAL_TimingAcquireQueryPair(
+    D3D12Renderer *renderer,
+    Uint32 *queryPairIndex)
+{
+    if (renderer->timingFreeQueryPairCount == 0) {
+        return false;
+    }
+
+    renderer->timingFreeQueryPairCount -= 1;
+    *queryPairIndex = renderer->timingFreeQueryPairs[renderer->timingFreeQueryPairCount];
+    return true;
+}
+
+static void D3D12_INTERNAL_TimingReleaseQueryPair(
+    D3D12Renderer *renderer,
+    Uint32 queryPairIndex)
+{
+    if (renderer->timingFreeQueryPairCount < renderer->timingQueryPairCapacity) {
+        renderer->timingFreeQueryPairs[renderer->timingFreeQueryPairCount] = queryPairIndex;
+        renderer->timingFreeQueryPairCount += 1;
+    }
+}
+
+static Sint32 D3D12_INTERNAL_FindTimingSampleIndex(
+    D3D12Renderer *renderer,
+    Uint64 sampleID)
+{
+    for (Uint32 i = 0; i < renderer->timingSampleCount; i += 1) {
+        if (renderer->timingSamples[i].sampleID == sampleID) {
+            return (Sint32)i;
+        }
+    }
+
+    return -1;
+}
+
+static void D3D12_INTERNAL_ReleaseTimingSampleResources(
+    D3D12Renderer *renderer,
+    D3D12TimingSample *sample)
+{
+    if (sample->queryReserved) {
+        D3D12_INTERNAL_TimingReleaseQueryPair(renderer, sample->queryPairIndex);
+        sample->queryReserved = false;
+    }
+
+    if (sample->fence != NULL) {
+        D3D12_ReleaseFence((SDL_GPURenderer *)renderer, (SDL_GPUFence *)sample->fence);
+        sample->fence = NULL;
+    }
+}
+
+static void D3D12_INTERNAL_RemoveTimingSampleByIndex(
+    D3D12Renderer *renderer,
+    Uint32 index)
+{
+    if (index >= renderer->timingSampleCount) {
+        return;
+    }
+
+    D3D12_INTERNAL_ReleaseTimingSampleResources(renderer, &renderer->timingSamples[index]);
+
+    renderer->timingSampleCount -= 1;
+    if (index != renderer->timingSampleCount) {
+        renderer->timingSamples[index] = renderer->timingSamples[renderer->timingSampleCount];
+    }
+}
+
+static void D3D12_INTERNAL_AbortTimingForCommandBuffer(
+    D3D12Renderer *renderer,
+    D3D12CommandBuffer *commandBuffer)
+{
+    if (!commandBuffer->common.timed || commandBuffer->common.timing_sample_id == 0) {
+        commandBuffer->timingQueryReserved = false;
+        commandBuffer->timingQueryPairIndex = 0;
+        return;
+    }
+
+    SDL_LockMutex(renderer->timingLock);
+    Sint32 sampleIndex = D3D12_INTERNAL_FindTimingSampleIndex(renderer, commandBuffer->common.timing_sample_id);
+    if (sampleIndex >= 0) {
+        D3D12_INTERNAL_RemoveTimingSampleByIndex(renderer, (Uint32)sampleIndex);
+    }
+    SDL_UnlockMutex(renderer->timingLock);
+
+    commandBuffer->common.timed = false;
+    commandBuffer->common.timing_sample_id = 0;
+    commandBuffer->timingQueryReserved = false;
+    commandBuffer->timingQueryPairIndex = 0;
 }
 
 // Xbox Hack
@@ -1674,6 +1835,28 @@ static void D3D12_INTERNAL_DestroyRenderer(D3D12Renderer *renderer)
         SDL_free(renderer->uniformBufferPool[i]);
     }
 
+    for (Uint32 i = 0; i < renderer->timingSampleCount; i += 1) {
+        D3D12_INTERNAL_ReleaseTimingSampleResources(renderer, &renderer->timingSamples[i]);
+    }
+    renderer->timingSampleCount = 0;
+    SDL_free(renderer->timingSamples);
+    renderer->timingSamples = NULL;
+    SDL_free(renderer->timingFreeQueryPairs);
+    renderer->timingFreeQueryPairs = NULL;
+    renderer->timingFreeQueryPairCount = 0;
+
+    if (renderer->timingReadbackBuffer != NULL) {
+        ID3D12Resource_Unmap(renderer->timingReadbackBuffer, 0, NULL);
+        ID3D12Resource_Release(renderer->timingReadbackBuffer);
+        renderer->timingReadbackBuffer = NULL;
+        renderer->timingReadbackMap = NULL;
+    }
+
+    if (renderer->timingQueryHeap != NULL) {
+        ID3D12QueryHeap_Release(renderer->timingQueryHeap);
+        renderer->timingQueryHeap = NULL;
+    }
+
     // Clean up descriptor heaps
     for (Uint32 i = 0; i < D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES; i += 1) {
         if (renderer->stagingDescriptorPools[i]) {
@@ -1799,6 +1982,7 @@ static void D3D12_INTERNAL_DestroyRenderer(D3D12Renderer *renderer)
     SDL_DestroyMutex(renderer->windowLock);
     SDL_DestroyMutex(renderer->fenceLock);
     SDL_DestroyMutex(renderer->disposeLock);
+    SDL_DestroyMutex(renderer->timingLock);
     SDL_free(renderer->semantic);
     SDL_free(renderer);
 }
@@ -7487,6 +7671,7 @@ static bool D3D12_SetAllowedFramesInFlight(
 
     // Set the frames in flight value
     renderer->allowedFramesInFlight = allowedFramesInFlight;
+    renderer->timingMaxLatencyFrames = SDL_max(3, allowedFramesInFlight + 1);
 
     // Recreate all swapchains
     for (Uint32 i = 0; i < renderer->claimedWindowCount; i += 1) {
@@ -7750,8 +7935,268 @@ static SDL_GPUCommandBuffer *D3D12_AcquireCommandBuffer(
     SDL_zeroa(commandBuffer->computeUniformBuffers);
 
     commandBuffer->autoReleaseFence = true;
+    commandBuffer->timingQueryPairIndex = 0;
+    commandBuffer->timingQueryReserved = false;
 
     return (SDL_GPUCommandBuffer *)commandBuffer;
+}
+
+static bool D3D12_AcquireTimedCommandBuffer(
+    SDL_GPUCommandBuffer *commandBuffer,
+    Uint64 *sampleID)
+{
+    D3D12CommandBuffer *d3d12CommandBuffer = (D3D12CommandBuffer *)commandBuffer;
+    D3D12Renderer *renderer = d3d12CommandBuffer->renderer;
+    D3D12TimingSample sample;
+    Uint32 queryPairIndex = 0;
+    bool reservedQueryPair = false;
+
+    SDL_zero(sample);
+
+    if (renderer->timingQueryHeap == NULL ||
+        renderer->timingReadbackMap == NULL ||
+        renderer->timingFreeQueryPairs == NULL ||
+        renderer->timingFrequency == 0) {
+        return SDL_SetError("D3D12 command buffer timing is unavailable");
+    }
+
+    SDL_LockMutex(renderer->timingLock);
+
+    if (!D3D12_INTERNAL_EnsureTimingSampleCapacity(renderer, renderer->timingSampleCount + 1)) {
+        SDL_UnlockMutex(renderer->timingLock);
+        return false;
+    }
+
+    renderer->timingSampleIDCounter += 1;
+    if (renderer->timingSampleIDCounter == 0) {
+        renderer->timingSampleIDCounter = 1;
+    }
+
+    sample.sampleID = renderer->timingSampleIDCounter;
+    sample.timeDomain = SDL_GPU_TIME_DOMAIN_GPU_TICKS;
+    sample.deviceGeneration = renderer->timingDeviceGeneration;
+    sample.frameID = renderer->timingFrameIDCounter;
+    sample.status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY;
+    sample.durationNS = 0;
+    sample.submitted = false;
+    sample.fence = NULL;
+
+    if (D3D12_INTERNAL_TimingAcquireQueryPair(renderer, &queryPairIndex)) {
+        sample.queryPairIndex = queryPairIndex;
+        sample.queryReserved = true;
+        reservedQueryPair = true;
+    } else {
+        sample.queryPairIndex = 0;
+        sample.queryReserved = false;
+        sample.status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_POOL_EXHAUSTED;
+    }
+
+    renderer->timingSamples[renderer->timingSampleCount] = sample;
+    renderer->timingSampleCount += 1;
+
+    *sampleID = sample.sampleID;
+
+    SDL_UnlockMutex(renderer->timingLock);
+
+    d3d12CommandBuffer->timingQueryPairIndex = queryPairIndex;
+    d3d12CommandBuffer->timingQueryReserved = reservedQueryPair;
+
+    if (reservedQueryPair) {
+        ID3D12GraphicsCommandList_EndQuery(
+            d3d12CommandBuffer->graphicsCommandList,
+            renderer->timingQueryHeap,
+            D3D12_QUERY_TYPE_TIMESTAMP,
+            queryPairIndex * 2);
+    }
+
+    return true;
+}
+
+static bool D3D12_BeginCommandBufferTimingFrame(
+    SDL_GPURenderer *driverData,
+    Uint64 *outFrameID)
+{
+    D3D12Renderer *renderer = (D3D12Renderer *)driverData;
+
+    SDL_LockMutex(renderer->timingLock);
+    renderer->timingFrameIDCounter += 1;
+    if (renderer->timingFrameIDCounter == 0) {
+        renderer->timingFrameIDCounter = 1;
+    }
+    *outFrameID = renderer->timingFrameIDCounter;
+    SDL_UnlockMutex(renderer->timingLock);
+
+    return true;
+}
+
+static bool D3D12_SetCommandBufferTimingConfig(
+    SDL_GPURenderer *driverData,
+    const SDL_GPUCommandBufferTimingConfig *config)
+{
+    D3D12Renderer *renderer = (D3D12Renderer *)driverData;
+    Uint32 minLatencyFrames = SDL_max(3, renderer->allowedFramesInFlight + 1);
+    Uint64 requiredQueryPairs;
+
+    if (config->max_latency_frames < minLatencyFrames) {
+        return SDL_SetError("D3D12 timing config max_latency_frames must be >= %u", minLatencyFrames);
+    }
+
+    if (config->max_timed_command_lists_per_frame == 0) {
+        return SDL_SetError("D3D12 timing config max_timed_command_lists_per_frame must be > 0");
+    }
+
+    if (config->max_timed_command_lists_per_frame > D3D12_TIMING_MAX_TIMED_COMMAND_LISTS_PER_FRAME) {
+        return SDL_SetError("D3D12 timing config max_timed_command_lists_per_frame exceeds backend limit %u", D3D12_TIMING_MAX_TIMED_COMMAND_LISTS_PER_FRAME);
+    }
+
+    requiredQueryPairs = (Uint64)config->max_latency_frames * (Uint64)config->max_timed_command_lists_per_frame;
+    if (requiredQueryPairs > renderer->timingQueryPairCapacity) {
+        return SDL_SetError("D3D12 timing config exceeds allocated query-pair capacity %u", renderer->timingQueryPairCapacity);
+    }
+
+    SDL_LockMutex(renderer->timingLock);
+    renderer->timingMaxLatencyFrames = config->max_latency_frames;
+    renderer->timingMaxTimedCommandListsPerFrame = config->max_timed_command_lists_per_frame;
+    SDL_UnlockMutex(renderer->timingLock);
+
+    return true;
+}
+
+static bool D3D12_GetCommandBufferTimingConfig(
+    SDL_GPURenderer *driverData,
+    SDL_GPUCommandBufferTimingConfig *config)
+{
+    D3D12Renderer *renderer = (D3D12Renderer *)driverData;
+
+    SDL_LockMutex(renderer->timingLock);
+    config->max_latency_frames = renderer->timingMaxLatencyFrames;
+    config->max_timed_command_lists_per_frame = renderer->timingMaxTimedCommandListsPerFrame;
+    SDL_UnlockMutex(renderer->timingLock);
+
+    return true;
+}
+
+static bool D3D12_GetCommandBufferTimingCapabilities(
+    SDL_GPURenderer *driverData,
+    SDL_GPUCommandBufferTimingCapabilities *capabilities)
+{
+    D3D12Renderer *renderer = (D3D12Renderer *)driverData;
+
+    SDL_zero(*capabilities);
+
+    capabilities->supports_timing = renderer->timingQueryHeap != NULL && renderer->timingReadbackBuffer != NULL;
+    capabilities->supports_view_timing = capabilities->supports_timing;
+    capabilities->supports_upload_timing = capabilities->supports_timing;
+    capabilities->supports_present_telemetry = false;
+    capabilities->max_latency_frames = renderer->timingMaxLatencyFrames;
+    capabilities->max_frames_in_flight = renderer->allowedFramesInFlight;
+    capabilities->max_timed_command_lists_per_frame = renderer->timingMaxTimedCommandListsPerFrame;
+
+    return true;
+}
+
+static bool D3D12_GetCommandBufferTimingDeviceGeneration(
+    SDL_GPURenderer *driverData,
+    Uint64 *outDeviceGeneration)
+{
+    D3D12Renderer *renderer = (D3D12Renderer *)driverData;
+
+    SDL_LockMutex(renderer->timingLock);
+    *outDeviceGeneration = renderer->timingDeviceGeneration;
+    SDL_UnlockMutex(renderer->timingLock);
+
+    return true;
+}
+
+static bool D3D12_PollCommandBufferTiming(
+    SDL_GPURenderer *driverData,
+    SDL_GPUCommandBufferTimingResult *results,
+    Uint32 maxResults,
+    Uint32 *outResultCount)
+{
+    D3D12Renderer *renderer = (D3D12Renderer *)driverData;
+    Uint32 emitted = 0;
+    Uint64 currentFrameID;
+
+    *outResultCount = 0;
+
+    if (maxResults == 0) {
+        return true;
+    }
+
+    SDL_LockMutex(renderer->timingLock);
+
+    currentFrameID = renderer->timingFrameIDCounter;
+
+    Uint32 sampleIndex = 0;
+    while (sampleIndex < renderer->timingSampleCount && emitted < maxResults) {
+        D3D12TimingSample *sample = &renderer->timingSamples[sampleIndex];
+        bool terminal = false;
+
+        if (sample->submitted && sample->status == SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY) {
+            if (sample->queryReserved) {
+                Uint64 fenceValue = ID3D12Fence_GetCompletedValue(sample->fence->handle);
+
+                if (fenceValue == D3D12_FENCE_SIGNAL_VALUE) {
+                    Uint64 startTicks = renderer->timingReadbackMap[(sample->queryPairIndex * 2) + 0];
+                    Uint64 endTicks = renderer->timingReadbackMap[(sample->queryPairIndex * 2) + 1];
+
+                    if (endTicks >= startTicks && renderer->timingFrequency > 0) {
+                        Uint64 deltaTicks = endTicks - startTicks;
+                        double durationDouble = ((double)deltaTicks * 1000000000.0) / (double)renderer->timingFrequency;
+
+                        if (durationDouble >= 0.0 && durationDouble <= (double)SDL_MAX_UINT64) {
+                            sample->durationNS = (Uint64)durationDouble;
+                            sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_OK;
+                        } else {
+                            sample->durationNS = 0;
+                            sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_BACKEND_ERROR;
+                        }
+                    } else {
+                        sample->durationNS = 0;
+                        sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_BACKEND_ERROR;
+                    }
+
+                    D3D12_INTERNAL_TimingReleaseQueryPair(renderer, sample->queryPairIndex);
+                    sample->queryReserved = false;
+                }
+            }
+
+            if (sample->status == SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY &&
+                currentFrameID > sample->frameID &&
+                (currentFrameID - sample->frameID) > renderer->timingMaxLatencyFrames) {
+                sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_DROPPED;
+
+                if (sample->queryReserved) {
+                    D3D12_INTERNAL_TimingReleaseQueryPair(renderer, sample->queryPairIndex);
+                    sample->queryReserved = false;
+                }
+            }
+        }
+
+        terminal = sample->submitted &&
+            sample->status != SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY;
+
+        if (terminal) {
+            SDL_GPUCommandBufferTimingResult *result = &results[emitted];
+            result->sample_id = sample->sampleID;
+            result->duration_ns = sample->durationNS;
+            result->time_domain = sample->timeDomain;
+            result->device_generation = sample->deviceGeneration;
+            result->status = sample->status;
+            emitted += 1;
+
+            D3D12_INTERNAL_RemoveTimingSampleByIndex(renderer, sampleIndex);
+            continue;
+        }
+
+        sampleIndex += 1;
+    }
+
+    SDL_UnlockMutex(renderer->timingLock);
+
+    *outResultCount = emitted;
+    return true;
 }
 
 static bool D3D12_WaitForSwapchain(
@@ -8112,6 +8557,8 @@ static bool D3D12_INTERNAL_CleanCommandBuffer(
 
     // Reset presentation
     commandBuffer->presentDataCount = 0;
+    commandBuffer->timingQueryPairIndex = 0;
+    commandBuffer->timingQueryReserved = false;
 
     // The fence is now available (unless SubmitAndAcquireFence was called)
     if (commandBuffer->autoReleaseFence) {
@@ -8201,15 +8648,40 @@ static bool D3D12_Submit(
             &barrierDesc);
     }
 
+    if (d3d12CommandBuffer->common.timed && d3d12CommandBuffer->timingQueryReserved) {
+        Uint32 firstQuery = d3d12CommandBuffer->timingQueryPairIndex * 2;
+        UINT64 resolveOffset = (UINT64)firstQuery * sizeof(Uint64);
+
+        ID3D12GraphicsCommandList_EndQuery(
+            d3d12CommandBuffer->graphicsCommandList,
+            renderer->timingQueryHeap,
+            D3D12_QUERY_TYPE_TIMESTAMP,
+            firstQuery + 1);
+
+        ID3D12GraphicsCommandList_ResolveQueryData(
+            d3d12CommandBuffer->graphicsCommandList,
+            renderer->timingQueryHeap,
+            D3D12_QUERY_TYPE_TIMESTAMP,
+            firstQuery,
+            2,
+            renderer->timingReadbackBuffer,
+            resolveOffset);
+    }
+
     // Notify the command buffer that we have completed recording
     res = ID3D12GraphicsCommandList_Close(d3d12CommandBuffer->graphicsCommandList);
-    CHECK_D3D12_ERROR_AND_RETURN("Failed to close command list!", false);
+    if (FAILED(res)) {
+        D3D12_INTERNAL_AbortTimingForCommandBuffer(renderer, d3d12CommandBuffer);
+        SDL_UnlockMutex(renderer->submitLock);
+        CHECK_D3D12_ERROR_AND_RETURN("Failed to close command list!", false);
+    }
 
     res = ID3D12GraphicsCommandList_QueryInterface(
         d3d12CommandBuffer->graphicsCommandList,
         D3D_GUID(D3D_IID_ID3D12CommandList),
         (void **)&commandLists[0]);
     if (FAILED(res)) {
+        D3D12_INTERNAL_AbortTimingForCommandBuffer(renderer, d3d12CommandBuffer);
         SDL_UnlockMutex(renderer->submitLock);
         CHECK_D3D12_ERROR_AND_RETURN("Failed to convert command list!", false);
     }
@@ -8225,6 +8697,7 @@ static bool D3D12_Submit(
     // Acquire a fence and set it to the in-flight fence
     d3d12CommandBuffer->inFlightFence = D3D12_INTERNAL_AcquireFence(renderer);
     if (!d3d12CommandBuffer->inFlightFence) {
+        D3D12_INTERNAL_AbortTimingForCommandBuffer(renderer, d3d12CommandBuffer);
         SDL_UnlockMutex(renderer->submitLock);
         return false;
     }
@@ -8235,8 +8708,28 @@ static bool D3D12_Submit(
         d3d12CommandBuffer->inFlightFence->handle,
         D3D12_FENCE_SIGNAL_VALUE);
     if (FAILED(res)) {
+        D3D12_ReleaseFence((SDL_GPURenderer *)renderer, (SDL_GPUFence *)d3d12CommandBuffer->inFlightFence);
+        d3d12CommandBuffer->inFlightFence = NULL;
+        D3D12_INTERNAL_AbortTimingForCommandBuffer(renderer, d3d12CommandBuffer);
         SDL_UnlockMutex(renderer->submitLock);
         CHECK_D3D12_ERROR_AND_RETURN("Failed to enqueue fence signal!", false);
+    }
+
+    if (d3d12CommandBuffer->common.timed && d3d12CommandBuffer->common.timing_sample_id != 0) {
+        SDL_LockMutex(renderer->timingLock);
+        Sint32 sampleIndex = D3D12_INTERNAL_FindTimingSampleIndex(renderer, d3d12CommandBuffer->common.timing_sample_id);
+        if (sampleIndex >= 0) {
+            D3D12TimingSample *sample = &renderer->timingSamples[sampleIndex];
+            sample->submitted = true;
+            renderer->timingSubmitSerial += 1;
+            sample->submitSerial = renderer->timingSubmitSerial;
+
+            if (d3d12CommandBuffer->timingQueryReserved) {
+                sample->fence = d3d12CommandBuffer->inFlightFence;
+                (void)SDL_AtomicIncRef(&sample->fence->referenceCount);
+            }
+        }
+        SDL_UnlockMutex(renderer->timingLock);
     }
 
     // Mark the command buffer as submitted
@@ -8342,6 +8835,8 @@ static bool D3D12_Cancel(
     D3D12Renderer *renderer = d3d12CommandBuffer->renderer;
     bool result;
     HRESULT res;
+
+    D3D12_INTERNAL_AbortTimingForCommandBuffer(renderer, d3d12CommandBuffer);
 
     // Notify the command buffer that we have completed recording
     res = ID3D12GraphicsCommandList_Close(d3d12CommandBuffer->graphicsCommandList);
@@ -8469,6 +8964,29 @@ static bool D3D12_WaitForFences(
 }
 
 // Feature Queries
+
+static void *D3D12_GetMetalDevice(
+    SDL_GPURenderer *driverData)
+{
+    (void)driverData;
+    return NULL;
+}
+
+static void *D3D12_GetMetalCommandBuffer(
+    SDL_GPUCommandBuffer *commandBuffer)
+{
+    (void)commandBuffer;
+    return NULL;
+}
+
+static void *D3D12_GetMetalTexture(
+    SDL_GPURenderer *driverData,
+    SDL_GPUTexture *texture)
+{
+    (void)driverData;
+    (void)texture;
+    return NULL;
+}
 
 static bool D3D12_SupportsTextureFormat(
     SDL_GPURenderer *driverData,
@@ -9542,6 +10060,10 @@ static SDL_GPUDevice *D3D12_CreateDevice(bool debugMode, bool preferLowPower, SD
 #endif
     D3D12_FEATURE_DATA_ARCHITECTURE architecture;
     D3D12_COMMAND_QUEUE_DESC queueDesc;
+    D3D12_QUERY_HEAP_DESC timingQueryHeapDesc;
+    D3D12_HEAP_PROPERTIES timingReadbackHeapProperties;
+    D3D12_RESOURCE_DESC timingReadbackResourceDesc;
+    UINT64 timingReadbackSize;
 
     bool verboseLogs = SDL_GetBooleanProperty(
         props,
@@ -10024,6 +10546,102 @@ static SDL_GPUDevice *D3D12_CreateDevice(bool debugMode, bool preferLowPower, SD
 #endif
 
     // Create indirect command signatures
+
+    renderer->timingMaxTimedCommandListsPerFrame = D3D12_TIMING_MAX_TIMED_COMMAND_LISTS_PER_FRAME;
+    renderer->timingMaxLatencyFrames = SDL_max(3, MAX_FRAMES_IN_FLIGHT + 1);
+    renderer->timingQueryPairCapacity =
+        renderer->timingMaxTimedCommandListsPerFrame * renderer->timingMaxLatencyFrames;
+    renderer->timingDeviceGeneration = 1;
+    renderer->timingFrameIDCounter = 0;
+    renderer->timingSampleIDCounter = 0;
+    renderer->timingSubmitSerial = 0;
+    renderer->timingSampleCapacity = 0;
+    renderer->timingSampleCount = 0;
+    renderer->timingSamples = NULL;
+    renderer->timingReadbackMap = NULL;
+
+    res = ID3D12CommandQueue_GetTimestampFrequency(renderer->commandQueue, &renderer->timingFrequency);
+    if (FAILED(res) || renderer->timingFrequency == 0) {
+        D3D12_INTERNAL_DestroyRenderer(renderer);
+        CHECK_D3D12_ERROR_AND_RETURN("Could not query D3D12 timestamp frequency", NULL);
+    }
+
+    SDL_zero(timingQueryHeapDesc);
+    timingQueryHeapDesc.Count = renderer->timingQueryPairCapacity * 2;
+    timingQueryHeapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    timingQueryHeapDesc.NodeMask = 0;
+
+    res = ID3D12Device_CreateQueryHeap(
+        renderer->device,
+        &timingQueryHeapDesc,
+        D3D_GUID(D3D_IID_ID3D12QueryHeap),
+        (void **)&renderer->timingQueryHeap);
+    if (FAILED(res)) {
+        D3D12_INTERNAL_DestroyRenderer(renderer);
+        CHECK_D3D12_ERROR_AND_RETURN("Could not create D3D12 timestamp query heap", NULL);
+    }
+
+    timingReadbackSize = ((UINT64)renderer->timingQueryPairCapacity * 2) * sizeof(Uint64);
+    SDL_zero(timingReadbackHeapProperties);
+    timingReadbackHeapProperties.Type = D3D12_HEAP_TYPE_READBACK;
+    timingReadbackHeapProperties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    timingReadbackHeapProperties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    timingReadbackHeapProperties.CreationNodeMask = 1;
+    timingReadbackHeapProperties.VisibleNodeMask = 1;
+
+    SDL_zero(timingReadbackResourceDesc);
+    timingReadbackResourceDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    timingReadbackResourceDesc.Alignment = 0;
+    timingReadbackResourceDesc.Width = timingReadbackSize;
+    timingReadbackResourceDesc.Height = 1;
+    timingReadbackResourceDesc.DepthOrArraySize = 1;
+    timingReadbackResourceDesc.MipLevels = 1;
+    timingReadbackResourceDesc.Format = DXGI_FORMAT_UNKNOWN;
+    timingReadbackResourceDesc.SampleDesc.Count = 1;
+    timingReadbackResourceDesc.SampleDesc.Quality = 0;
+    timingReadbackResourceDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    timingReadbackResourceDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    res = ID3D12Device_CreateCommittedResource(
+        renderer->device,
+        &timingReadbackHeapProperties,
+        D3D12_HEAP_FLAG_NONE,
+        &timingReadbackResourceDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        NULL,
+        D3D_GUID(D3D_IID_ID3D12Resource),
+        (void **)&renderer->timingReadbackBuffer);
+    if (FAILED(res)) {
+        D3D12_INTERNAL_DestroyRenderer(renderer);
+        CHECK_D3D12_ERROR_AND_RETURN("Could not create D3D12 timing readback buffer", NULL);
+    }
+
+    res = ID3D12Resource_Map(
+        renderer->timingReadbackBuffer,
+        0,
+        NULL,
+        (void **)&renderer->timingReadbackMap);
+    if (FAILED(res) || renderer->timingReadbackMap == NULL) {
+        D3D12_INTERNAL_DestroyRenderer(renderer);
+        CHECK_D3D12_ERROR_AND_RETURN("Could not map D3D12 timing readback buffer", NULL);
+    }
+
+    renderer->timingFreeQueryPairs = (Uint32 *)SDL_malloc(sizeof(Uint32) * renderer->timingQueryPairCapacity);
+    if (renderer->timingFreeQueryPairs == NULL) {
+        D3D12_INTERNAL_DestroyRenderer(renderer);
+        return NULL;
+    }
+
+    for (Uint32 i = 0; i < renderer->timingQueryPairCapacity; i += 1) {
+        renderer->timingFreeQueryPairs[i] = renderer->timingQueryPairCapacity - i - 1;
+    }
+    renderer->timingFreeQueryPairCount = renderer->timingQueryPairCapacity;
+
+    renderer->timingLock = SDL_CreateMutex();
+    if (renderer->timingLock == NULL) {
+        D3D12_INTERNAL_DestroyRenderer(renderer);
+        return NULL;
+    }
 
     D3D12_COMMAND_SIGNATURE_DESC commandSignatureDesc;
     D3D12_INDIRECT_ARGUMENT_DESC indirectArgumentDesc;

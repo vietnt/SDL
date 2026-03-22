@@ -78,6 +78,7 @@ typedef struct VulkanExtensions
 #define MAX_UBO_SECTION_SIZE          4096     // 4   KiB
 #define DESCRIPTOR_POOL_SIZE          128
 #define WINDOW_PROPERTY_DATA          "SDL.internal.gpu.vulkan.data"
+#define VULKAN_TIMING_MAX_TIMED_COMMAND_LISTS_PER_FRAME 1024
 
 #define IDENTITY_SWIZZLE               \
     {                                  \
@@ -972,6 +973,21 @@ typedef struct VulkanFencePool
     Uint32 availableFenceCapacity;
 } VulkanFencePool;
 
+typedef struct VulkanTimingSample
+{
+    Uint64 sampleID;
+    SDL_GPUCommandBufferTimingStatus status;
+    SDL_GPUTimeDomain timeDomain;
+    Uint64 durationNS;
+    Uint64 deviceGeneration;
+    Uint64 frameID;
+    Uint64 submitSerial;
+    Uint32 queryPairIndex;
+    VulkanFenceHandle *fence;
+    bool submitted;
+    bool queryReserved;
+} VulkanTimingSample;
+
 typedef struct VulkanCommandBuffer
 {
     CommandBufferCommonHeader common;
@@ -1106,6 +1122,8 @@ typedef struct VulkanCommandBuffer
 
     VulkanFenceHandle *inFlightFence;
     bool autoReleaseFence;
+    Uint32 timingQueryPairIndex;
+    bool timingQueryReserved;
 
     bool swapchainRequested;
     bool isDefrag; // Whether this CB was created for defragging
@@ -1191,6 +1209,23 @@ struct VulkanRenderer
 
     VulkanFencePool fencePool;
 
+    VkQueryPool timingQueryPool;
+    Uint32 *timingFreeQueryPairs;
+    Uint32 timingFreeQueryPairCount;
+    Uint32 timingQueryPairCapacity;
+    Uint32 timingValidBits;
+    float timingTimestampPeriod;
+    VulkanTimingSample *timingSamples;
+    Uint32 timingSampleCount;
+    Uint32 timingSampleCapacity;
+    Uint64 timingSampleIDCounter;
+    Uint64 timingSubmitSerial;
+    Uint64 timingFrameIDCounter;
+    Uint64 timingDeviceGeneration;
+    Uint32 timingMaxLatencyFrames;
+    Uint32 timingMaxTimedCommandListsPerFrame;
+    SDL_Mutex *timingLock;
+
     SDL_HashTable *commandPoolHashTable;
     SDL_HashTable *renderPassHashTable;
     SDL_HashTable *framebufferHashTable;
@@ -1272,8 +1307,16 @@ static bool VULKAN_INTERNAL_BeginCommandBuffer(VulkanRenderer *renderer, VulkanC
 static void VULKAN_ReleaseWindow(SDL_GPURenderer *driverData, SDL_Window *window);
 static bool VULKAN_Wait(SDL_GPURenderer *driverData);
 static bool VULKAN_WaitForFences(SDL_GPURenderer *driverData, bool waitAll, SDL_GPUFence *const *fences, Uint32 numFences);
+static void VULKAN_ReleaseFence(SDL_GPURenderer *driverData, SDL_GPUFence *fence);
 static bool VULKAN_Submit(SDL_GPUCommandBuffer *commandBuffer);
 static SDL_GPUCommandBuffer *VULKAN_AcquireCommandBuffer(SDL_GPURenderer *driverData);
+static bool VULKAN_AcquireTimedCommandBuffer(SDL_GPUCommandBuffer *commandBuffer, Uint64 *sampleID);
+static bool VULKAN_BeginCommandBufferTimingFrame(SDL_GPURenderer *driverData, Uint64 *outFrameID);
+static bool VULKAN_SetCommandBufferTimingConfig(SDL_GPURenderer *driverData, const SDL_GPUCommandBufferTimingConfig *config);
+static bool VULKAN_GetCommandBufferTimingConfig(SDL_GPURenderer *driverData, SDL_GPUCommandBufferTimingConfig *config);
+static bool VULKAN_GetCommandBufferTimingCapabilities(SDL_GPURenderer *driverData, SDL_GPUCommandBufferTimingCapabilities *capabilities);
+static bool VULKAN_GetCommandBufferTimingDeviceGeneration(SDL_GPURenderer *driverData, Uint64 *outDeviceGeneration);
+static bool VULKAN_PollCommandBufferTiming(SDL_GPURenderer *driverData, SDL_GPUCommandBufferTimingResult *results, Uint32 maxResults, Uint32 *outResultCount);
 
 // Error Handling
 
@@ -1372,6 +1415,121 @@ static inline Uint32 VULKAN_INTERNAL_NextHighestAlignment32(
     Uint32 align)
 {
     return align * ((n + align - 1) / align);
+}
+
+static bool VULKAN_INTERNAL_EnsureTimingSampleCapacity(
+    VulkanRenderer *renderer,
+    Uint32 requiredCount)
+{
+    if (requiredCount <= renderer->timingSampleCapacity) {
+        return true;
+    }
+
+    Uint32 newCapacity = renderer->timingSampleCapacity == 0 ? 16 : renderer->timingSampleCapacity;
+    while (newCapacity < requiredCount) {
+        newCapacity *= 2;
+    }
+
+    VulkanTimingSample *resized = (VulkanTimingSample *)SDL_realloc(
+        renderer->timingSamples,
+        sizeof(VulkanTimingSample) * newCapacity);
+
+    if (resized == NULL) {
+        return SDL_OutOfMemory();
+    }
+
+    renderer->timingSamples = resized;
+    renderer->timingSampleCapacity = newCapacity;
+    return true;
+}
+
+static bool VULKAN_INTERNAL_TimingAcquireQueryPair(
+    VulkanRenderer *renderer,
+    Uint32 *queryPairIndex)
+{
+    if (renderer->timingFreeQueryPairCount == 0) {
+        return false;
+    }
+
+    renderer->timingFreeQueryPairCount -= 1;
+    *queryPairIndex = renderer->timingFreeQueryPairs[renderer->timingFreeQueryPairCount];
+    return true;
+}
+
+static void VULKAN_INTERNAL_TimingReleaseQueryPair(
+    VulkanRenderer *renderer,
+    Uint32 queryPairIndex)
+{
+    if (renderer->timingFreeQueryPairCount < renderer->timingQueryPairCapacity) {
+        renderer->timingFreeQueryPairs[renderer->timingFreeQueryPairCount] = queryPairIndex;
+        renderer->timingFreeQueryPairCount += 1;
+    }
+}
+
+static Sint32 VULKAN_INTERNAL_FindTimingSampleIndex(
+    VulkanRenderer *renderer,
+    Uint64 sampleID)
+{
+    for (Uint32 i = 0; i < renderer->timingSampleCount; i += 1) {
+        if (renderer->timingSamples[i].sampleID == sampleID) {
+            return (Sint32)i;
+        }
+    }
+
+    return -1;
+}
+
+static void VULKAN_INTERNAL_ReleaseTimingSampleResources(
+    VulkanRenderer *renderer,
+    VulkanTimingSample *sample)
+{
+    if (sample->queryReserved) {
+        VULKAN_INTERNAL_TimingReleaseQueryPair(renderer, sample->queryPairIndex);
+        sample->queryReserved = false;
+    }
+
+    if (sample->fence != NULL) {
+        VULKAN_ReleaseFence((SDL_GPURenderer *)renderer, (SDL_GPUFence *)sample->fence);
+        sample->fence = NULL;
+    }
+}
+
+static void VULKAN_INTERNAL_RemoveTimingSampleByIndex(
+    VulkanRenderer *renderer,
+    Uint32 index)
+{
+    if (index >= renderer->timingSampleCount) {
+        return;
+    }
+
+    VULKAN_INTERNAL_ReleaseTimingSampleResources(renderer, &renderer->timingSamples[index]);
+    renderer->timingSampleCount -= 1;
+    if (index != renderer->timingSampleCount) {
+        renderer->timingSamples[index] = renderer->timingSamples[renderer->timingSampleCount];
+    }
+}
+
+static void VULKAN_INTERNAL_AbortTimingForCommandBuffer(
+    VulkanRenderer *renderer,
+    VulkanCommandBuffer *commandBuffer)
+{
+    if (!commandBuffer->common.timed || commandBuffer->common.timing_sample_id == 0) {
+        commandBuffer->timingQueryReserved = false;
+        commandBuffer->timingQueryPairIndex = 0;
+        return;
+    }
+
+    SDL_LockMutex(renderer->timingLock);
+    Sint32 sampleIndex = VULKAN_INTERNAL_FindTimingSampleIndex(renderer, commandBuffer->common.timing_sample_id);
+    if (sampleIndex >= 0) {
+        VULKAN_INTERNAL_RemoveTimingSampleByIndex(renderer, (Uint32)sampleIndex);
+    }
+    SDL_UnlockMutex(renderer->timingLock);
+
+    commandBuffer->common.timed = false;
+    commandBuffer->common.timing_sample_id = 0;
+    commandBuffer->timingQueryReserved = false;
+    commandBuffer->timingQueryPairIndex = 0;
 }
 
 static void VULKAN_INTERNAL_MakeMemoryUnavailable(
@@ -2704,7 +2862,7 @@ static void VULKAN_INTERNAL_TextureSubresourceMemoryBarrier(
         memoryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         memoryBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     } else if (sourceUsageMode == VULKAN_TEXTURE_USAGE_MODE_SAMPLER) {
-        srcStages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        srcStages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
         memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
         memoryBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     } else if (sourceUsageMode == VULKAN_TEXTURE_USAGE_MODE_GRAPHICS_STORAGE_READ) {
@@ -2741,7 +2899,7 @@ static void VULKAN_INTERNAL_TextureSubresourceMemoryBarrier(
         memoryBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         memoryBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     } else if (destinationUsageMode == VULKAN_TEXTURE_USAGE_MODE_SAMPLER) {
-        dstStages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        dstStages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
         memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         memoryBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     } else if (destinationUsageMode == VULKAN_TEXTURE_USAGE_MODE_GRAPHICS_STORAGE_READ) {
@@ -2799,10 +2957,10 @@ static VulkanBufferUsageMode VULKAN_INTERNAL_DefaultBufferUsageMode(
         return VULKAN_BUFFER_USAGE_MODE_INDIRECT;
     } else if (buffer->usage & SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ) {
         return VULKAN_BUFFER_USAGE_MODE_GRAPHICS_STORAGE_READ;
-    } else if (buffer->usage & SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE) {
-        return VULKAN_BUFFER_USAGE_MODE_COMPUTE_STORAGE_READ_WRITE;
     } else if (buffer->usage & SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ) {
         return VULKAN_BUFFER_USAGE_MODE_COMPUTE_STORAGE_READ;
+    } else if (buffer->usage & SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE) {
+        return VULKAN_BUFFER_USAGE_MODE_COMPUTE_STORAGE_READ_WRITE;
     } else {
         SDL_LogError(SDL_LOG_CATEGORY_GPU, "Buffer has no default usage mode!");
         return VULKAN_BUFFER_USAGE_MODE_VERTEX_READ;
@@ -4940,6 +5098,21 @@ static void VULKAN_DestroyDevice(
     SDL_free(renderer->fencePool.availableFences);
     SDL_DestroyMutex(renderer->fencePool.lock);
 
+    for (Uint32 i = 0; i < renderer->timingSampleCount; i += 1) {
+        VULKAN_INTERNAL_ReleaseTimingSampleResources(renderer, &renderer->timingSamples[i]);
+    }
+    renderer->timingSampleCount = 0;
+    SDL_free(renderer->timingSamples);
+    renderer->timingSamples = NULL;
+    SDL_free(renderer->timingFreeQueryPairs);
+    renderer->timingFreeQueryPairs = NULL;
+    renderer->timingFreeQueryPairCount = 0;
+
+    if (renderer->timingQueryPool != VK_NULL_HANDLE) {
+        renderer->vkDestroyQueryPool(renderer->logicalDevice, renderer->timingQueryPool, NULL);
+        renderer->timingQueryPool = VK_NULL_HANDLE;
+    }
+
     SDL_DestroyHashTable(renderer->commandPoolHashTable);
     SDL_DestroyHashTable(renderer->renderPassHashTable);
     SDL_DestroyHashTable(renderer->framebufferHashTable);
@@ -4990,6 +5163,7 @@ static void VULKAN_DestroyDevice(
     SDL_DestroyMutex(renderer->computePipelineLayoutFetchLock);
     SDL_DestroyMutex(renderer->descriptorSetLayoutFetchLock);
     SDL_DestroyMutex(renderer->windowLock);
+    SDL_DestroyMutex(renderer->timingLock);
 
     renderer->vkDestroyDevice(renderer->logicalDevice, NULL);
     renderer->vkDestroyInstance(renderer->instance, NULL);
@@ -9686,6 +9860,8 @@ static SDL_GPUCommandBuffer *VULKAN_AcquireCommandBuffer(
     SDL_zeroa(commandBuffer->readOnlyComputeStorageBuffers);
 
     commandBuffer->autoReleaseFence = true;
+    commandBuffer->timingQueryPairIndex = 0;
+    commandBuffer->timingQueryReserved = false;
 
     commandBuffer->swapchainRequested = false;
     commandBuffer->isDefrag = 0;
@@ -9704,6 +9880,311 @@ static SDL_GPUCommandBuffer *VULKAN_AcquireCommandBuffer(
     }
 
     return (SDL_GPUCommandBuffer *)commandBuffer;
+}
+
+static bool VULKAN_AcquireTimedCommandBuffer(
+    SDL_GPUCommandBuffer *commandBuffer,
+    Uint64 *sampleID)
+{
+    VulkanCommandBuffer *vulkanCommandBuffer = (VulkanCommandBuffer *)commandBuffer;
+    VulkanRenderer *renderer = vulkanCommandBuffer->renderer;
+    VulkanTimingSample sample;
+    Uint32 queryPairIndex = 0;
+    bool reservedQueryPair = false;
+
+    SDL_zero(sample);
+
+    if (renderer->timingQueryPool == VK_NULL_HANDLE ||
+        renderer->timingFreeQueryPairs == NULL ||
+        renderer->timingValidBits == 0) {
+        return SDL_SetError("Vulkan command buffer timing is unavailable");
+    }
+
+    SDL_LockMutex(renderer->timingLock);
+
+    if (!VULKAN_INTERNAL_EnsureTimingSampleCapacity(renderer, renderer->timingSampleCount + 1)) {
+        SDL_UnlockMutex(renderer->timingLock);
+        return false;
+    }
+
+    renderer->timingSampleIDCounter += 1;
+    if (renderer->timingSampleIDCounter == 0) {
+        renderer->timingSampleIDCounter = 1;
+    }
+
+    sample.sampleID = renderer->timingSampleIDCounter;
+    sample.timeDomain = SDL_GPU_TIME_DOMAIN_GPU_TICKS;
+    sample.deviceGeneration = renderer->timingDeviceGeneration;
+    sample.frameID = renderer->timingFrameIDCounter;
+    sample.status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY;
+    sample.durationNS = 0;
+    sample.submitted = false;
+    sample.fence = NULL;
+
+    if (VULKAN_INTERNAL_TimingAcquireQueryPair(renderer, &queryPairIndex)) {
+        sample.queryPairIndex = queryPairIndex;
+        sample.queryReserved = true;
+        reservedQueryPair = true;
+    } else {
+        sample.queryPairIndex = 0;
+        sample.queryReserved = false;
+        sample.status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_POOL_EXHAUSTED;
+    }
+
+    renderer->timingSamples[renderer->timingSampleCount] = sample;
+    renderer->timingSampleCount += 1;
+
+    *sampleID = sample.sampleID;
+
+    SDL_UnlockMutex(renderer->timingLock);
+
+    vulkanCommandBuffer->timingQueryPairIndex = queryPairIndex;
+    vulkanCommandBuffer->timingQueryReserved = reservedQueryPair;
+
+    if (reservedQueryPair) {
+        Uint32 firstQuery = queryPairIndex * 2;
+
+        renderer->vkCmdResetQueryPool(
+            vulkanCommandBuffer->commandBuffer,
+            renderer->timingQueryPool,
+            firstQuery,
+            2);
+
+        renderer->vkCmdWriteTimestamp(
+            vulkanCommandBuffer->commandBuffer,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            renderer->timingQueryPool,
+            firstQuery);
+    }
+
+    return true;
+}
+
+static bool VULKAN_BeginCommandBufferTimingFrame(
+    SDL_GPURenderer *driverData,
+    Uint64 *outFrameID)
+{
+    VulkanRenderer *renderer = (VulkanRenderer *)driverData;
+
+    SDL_LockMutex(renderer->timingLock);
+    renderer->timingFrameIDCounter += 1;
+    if (renderer->timingFrameIDCounter == 0) {
+        renderer->timingFrameIDCounter = 1;
+    }
+    *outFrameID = renderer->timingFrameIDCounter;
+    SDL_UnlockMutex(renderer->timingLock);
+
+    return true;
+}
+
+static bool VULKAN_SetCommandBufferTimingConfig(
+    SDL_GPURenderer *driverData,
+    const SDL_GPUCommandBufferTimingConfig *config)
+{
+    VulkanRenderer *renderer = (VulkanRenderer *)driverData;
+    Uint32 minLatencyFrames = SDL_max(3, renderer->allowedFramesInFlight + 1);
+    Uint64 requiredQueryPairs;
+
+    if (config->max_latency_frames < minLatencyFrames) {
+        return SDL_SetError("Vulkan timing config max_latency_frames must be >= %u", minLatencyFrames);
+    }
+
+    if (config->max_timed_command_lists_per_frame == 0) {
+        return SDL_SetError("Vulkan timing config max_timed_command_lists_per_frame must be > 0");
+    }
+
+    if (config->max_timed_command_lists_per_frame > VULKAN_TIMING_MAX_TIMED_COMMAND_LISTS_PER_FRAME) {
+        return SDL_SetError("Vulkan timing config max_timed_command_lists_per_frame exceeds backend limit %u", VULKAN_TIMING_MAX_TIMED_COMMAND_LISTS_PER_FRAME);
+    }
+
+    requiredQueryPairs = (Uint64)config->max_latency_frames * (Uint64)config->max_timed_command_lists_per_frame;
+    if (requiredQueryPairs > renderer->timingQueryPairCapacity) {
+        return SDL_SetError("Vulkan timing config exceeds allocated query-pair capacity %u", renderer->timingQueryPairCapacity);
+    }
+
+    SDL_LockMutex(renderer->timingLock);
+    renderer->timingMaxLatencyFrames = config->max_latency_frames;
+    renderer->timingMaxTimedCommandListsPerFrame = config->max_timed_command_lists_per_frame;
+    SDL_UnlockMutex(renderer->timingLock);
+
+    return true;
+}
+
+static bool VULKAN_GetCommandBufferTimingConfig(
+    SDL_GPURenderer *driverData,
+    SDL_GPUCommandBufferTimingConfig *config)
+{
+    VulkanRenderer *renderer = (VulkanRenderer *)driverData;
+
+    SDL_LockMutex(renderer->timingLock);
+    config->max_latency_frames = renderer->timingMaxLatencyFrames;
+    config->max_timed_command_lists_per_frame = renderer->timingMaxTimedCommandListsPerFrame;
+    SDL_UnlockMutex(renderer->timingLock);
+
+    return true;
+}
+
+static bool VULKAN_GetCommandBufferTimingCapabilities(
+    SDL_GPURenderer *driverData,
+    SDL_GPUCommandBufferTimingCapabilities *capabilities)
+{
+    VulkanRenderer *renderer = (VulkanRenderer *)driverData;
+
+    SDL_zero(*capabilities);
+
+    capabilities->supports_timing = renderer->timingQueryPool != VK_NULL_HANDLE;
+    capabilities->supports_view_timing = capabilities->supports_timing;
+    capabilities->supports_upload_timing = capabilities->supports_timing;
+    capabilities->supports_present_telemetry = false;
+    capabilities->max_latency_frames = renderer->timingMaxLatencyFrames;
+    capabilities->max_frames_in_flight = renderer->allowedFramesInFlight;
+    capabilities->max_timed_command_lists_per_frame = renderer->timingMaxTimedCommandListsPerFrame;
+
+    return true;
+}
+
+static bool VULKAN_GetCommandBufferTimingDeviceGeneration(
+    SDL_GPURenderer *driverData,
+    Uint64 *outDeviceGeneration)
+{
+    VulkanRenderer *renderer = (VulkanRenderer *)driverData;
+
+    SDL_LockMutex(renderer->timingLock);
+    *outDeviceGeneration = renderer->timingDeviceGeneration;
+    SDL_UnlockMutex(renderer->timingLock);
+
+    return true;
+}
+
+static bool VULKAN_PollCommandBufferTiming(
+    SDL_GPURenderer *driverData,
+    SDL_GPUCommandBufferTimingResult *results,
+    Uint32 maxResults,
+    Uint32 *outResultCount)
+{
+    VulkanRenderer *renderer = (VulkanRenderer *)driverData;
+    Uint32 emitted = 0;
+    Uint64 currentFrameID;
+
+    *outResultCount = 0;
+
+    if (maxResults == 0) {
+        return true;
+    }
+
+    SDL_LockMutex(renderer->timingLock);
+
+    currentFrameID = renderer->timingFrameIDCounter;
+
+    Uint32 sampleIndex = 0;
+    while (sampleIndex < renderer->timingSampleCount && emitted < maxResults) {
+        VulkanTimingSample *sample = &renderer->timingSamples[sampleIndex];
+        bool terminal = false;
+
+        if (sample->submitted && sample->status == SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY) {
+            if (sample->queryReserved) {
+                VkResult fenceStatus = renderer->vkGetFenceStatus(renderer->logicalDevice, sample->fence->fence);
+
+                if (fenceStatus == VK_SUCCESS) {
+                    Uint64 queryValues[2];
+                    VkResult queryResult = renderer->vkGetQueryPoolResults(
+                        renderer->logicalDevice,
+                        renderer->timingQueryPool,
+                        sample->queryPairIndex * 2,
+                        2,
+                        sizeof(queryValues),
+                        queryValues,
+                        sizeof(Uint64),
+                        VK_QUERY_RESULT_64_BIT);
+
+                    if (queryResult == VK_SUCCESS) {
+                        Uint64 startTicks = queryValues[0];
+                        Uint64 endTicks = queryValues[1];
+                        Uint64 deltaTicks = 0;
+                        bool deltaValid = true;
+
+                        if (renderer->timingValidBits > 0 && renderer->timingValidBits < 64) {
+                            Uint64 modulus = 1ULL << renderer->timingValidBits;
+                            Uint64 mask = modulus - 1;
+                            startTicks &= mask;
+                            endTicks &= mask;
+
+                            if (endTicks >= startTicks) {
+                                deltaTicks = endTicks - startTicks;
+                            } else {
+                                deltaTicks = (modulus - startTicks) + endTicks;
+                            }
+                        } else if (endTicks >= startTicks) {
+                            deltaTicks = endTicks - startTicks;
+                        } else {
+                            deltaValid = false;
+                        }
+
+                        if (deltaValid) {
+                            double durationDouble = (double)deltaTicks * (double)renderer->timingTimestampPeriod;
+
+                            if (durationDouble >= 0.0 && durationDouble <= (double)SDL_MAX_UINT64) {
+                                sample->durationNS = (Uint64)durationDouble;
+                                sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_OK;
+                            } else {
+                                sample->durationNS = 0;
+                                sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_BACKEND_ERROR;
+                            }
+                        } else {
+                            sample->durationNS = 0;
+                            sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_BACKEND_ERROR;
+                        }
+                    } else if (queryResult != VK_NOT_READY) {
+                        sample->durationNS = 0;
+                        sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_BACKEND_ERROR;
+                    }
+
+                    if (sample->status != SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY) {
+                        VULKAN_INTERNAL_TimingReleaseQueryPair(renderer, sample->queryPairIndex);
+                        sample->queryReserved = false;
+                    }
+                } else if (fenceStatus != VK_NOT_READY) {
+                    sample->durationNS = 0;
+                    sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_BACKEND_ERROR;
+                    VULKAN_INTERNAL_TimingReleaseQueryPair(renderer, sample->queryPairIndex);
+                    sample->queryReserved = false;
+                }
+            }
+
+            if (sample->status == SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY &&
+                currentFrameID > sample->frameID &&
+                (currentFrameID - sample->frameID) > renderer->timingMaxLatencyFrames) {
+                sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_DROPPED;
+                if (sample->queryReserved) {
+                    VULKAN_INTERNAL_TimingReleaseQueryPair(renderer, sample->queryPairIndex);
+                    sample->queryReserved = false;
+                }
+            }
+        }
+
+        terminal = sample->submitted &&
+            sample->status != SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY;
+
+        if (terminal) {
+            SDL_GPUCommandBufferTimingResult *result = &results[emitted];
+            result->sample_id = sample->sampleID;
+            result->duration_ns = sample->durationNS;
+            result->time_domain = sample->timeDomain;
+            result->device_generation = sample->deviceGeneration;
+            result->status = sample->status;
+            emitted += 1;
+
+            VULKAN_INTERNAL_RemoveTimingSampleByIndex(renderer, sampleIndex);
+            continue;
+        }
+
+        sampleIndex += 1;
+    }
+
+    SDL_UnlockMutex(renderer->timingLock);
+
+    *outResultCount = emitted;
+    return true;
 }
 
 static bool VULKAN_QueryFence(
@@ -10361,6 +10842,7 @@ static bool VULKAN_SetAllowedFramesInFlight(
     VulkanRenderer *renderer = (VulkanRenderer *)driverData;
 
     renderer->allowedFramesInFlight = allowedFramesInFlight;
+    renderer->timingMaxLatencyFrames = SDL_max(3, allowedFramesInFlight + 1);
 
     for (Uint32 i = 0; i < renderer->claimedWindowCount; i += 1) {
         WindowData *windowData = renderer->claimedWindows[i];
@@ -10573,6 +11055,8 @@ static void VULKAN_INTERNAL_CleanCommandBuffer(
     commandBuffer->waitSemaphoreCount = 0;
     commandBuffer->signalSemaphoreCount = 0;
     commandBuffer->swapchainRequested = false;
+    commandBuffer->timingQueryPairIndex = 0;
+    commandBuffer->timingQueryReserved = false;
 
     // Reset defrag state
 
@@ -10769,13 +11253,23 @@ static bool VULKAN_Submit(
         }
     }
 
+    if (vulkanCommandBuffer->common.timed && vulkanCommandBuffer->timingQueryReserved) {
+        renderer->vkCmdWriteTimestamp(
+            vulkanCommandBuffer->commandBuffer,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            renderer->timingQueryPool,
+            (vulkanCommandBuffer->timingQueryPairIndex * 2) + 1);
+    }
+
     if (!VULKAN_INTERNAL_EndCommandBuffer(renderer, vulkanCommandBuffer)) {
+        VULKAN_INTERNAL_AbortTimingForCommandBuffer(renderer, vulkanCommandBuffer);
         SDL_UnlockMutex(renderer->submitLock);
         return false;
     }
 
     vulkanCommandBuffer->inFlightFence = VULKAN_INTERNAL_AcquireFenceFromPool(renderer);
     if (vulkanCommandBuffer->inFlightFence == NULL) {
+        VULKAN_INTERNAL_AbortTimingForCommandBuffer(renderer, vulkanCommandBuffer);
         SDL_UnlockMutex(renderer->submitLock);
         return false;
     }
@@ -10801,8 +11295,27 @@ static bool VULKAN_Submit(
         vulkanCommandBuffer->inFlightFence->fence);
 
     if (vulkanResult != VK_SUCCESS) {
+        VULKAN_ReleaseFence((SDL_GPURenderer *)renderer, (SDL_GPUFence *)vulkanCommandBuffer->inFlightFence);
+        vulkanCommandBuffer->inFlightFence = NULL;
+        VULKAN_INTERNAL_AbortTimingForCommandBuffer(renderer, vulkanCommandBuffer);
         SDL_UnlockMutex(renderer->submitLock);
         CHECK_VULKAN_ERROR_AND_RETURN(vulkanResult, vkQueueSubmit, false);
+    }
+
+    if (vulkanCommandBuffer->common.timed && vulkanCommandBuffer->common.timing_sample_id != 0) {
+        SDL_LockMutex(renderer->timingLock);
+        Sint32 sampleIndex = VULKAN_INTERNAL_FindTimingSampleIndex(renderer, vulkanCommandBuffer->common.timing_sample_id);
+        if (sampleIndex >= 0) {
+            VulkanTimingSample *sample = &renderer->timingSamples[sampleIndex];
+            sample->submitted = true;
+            renderer->timingSubmitSerial += 1;
+            sample->submitSerial = renderer->timingSubmitSerial;
+            if (vulkanCommandBuffer->timingQueryReserved) {
+                sample->fence = vulkanCommandBuffer->inFlightFence;
+                (void)SDL_AtomicIncRef(&sample->fence->referenceCount);
+            }
+        }
+        SDL_UnlockMutex(renderer->timingLock);
     }
 
     // Present, if applicable
@@ -10910,6 +11423,8 @@ static bool VULKAN_Cancel(
 
     vulkanCommandBuffer = (VulkanCommandBuffer *)commandBuffer;
     renderer = vulkanCommandBuffer->renderer;
+
+    VULKAN_INTERNAL_AbortTimingForCommandBuffer(renderer, vulkanCommandBuffer);
 
     result = renderer->vkResetCommandBuffer(
         vulkanCommandBuffer->commandBuffer,
@@ -11099,6 +11614,29 @@ static bool VULKAN_INTERNAL_DefragmentMemory(
 }
 
 // Format Info
+
+static void *VULKAN_GetMetalDevice(
+    SDL_GPURenderer *driverData)
+{
+    (void)driverData;
+    return NULL;
+}
+
+static void *VULKAN_GetMetalCommandBuffer(
+    SDL_GPUCommandBuffer *commandBuffer)
+{
+    (void)commandBuffer;
+    return NULL;
+}
+
+static void *VULKAN_GetMetalTexture(
+    SDL_GPURenderer *driverData,
+    SDL_GPUTexture *texture)
+{
+    (void)driverData;
+    (void)texture;
+    return NULL;
+}
 
 static bool VULKAN_SupportsTextureFormat(
     SDL_GPURenderer *driverData,
@@ -13538,6 +14076,74 @@ static SDL_GPUDevice *VULKAN_CreateDevice(bool debugMode, bool preferLowPower, S
     renderer->fencePool.availableFenceCount = 0;
     renderer->fencePool.availableFences = SDL_malloc(
         renderer->fencePool.availableFenceCapacity * sizeof(VulkanFenceHandle *));
+
+    renderer->timingLock = SDL_CreateMutex();
+    renderer->timingMaxTimedCommandListsPerFrame = VULKAN_TIMING_MAX_TIMED_COMMAND_LISTS_PER_FRAME;
+    renderer->timingMaxLatencyFrames = SDL_max(3, MAX_FRAMES_IN_FLIGHT + 1);
+    renderer->timingQueryPairCapacity =
+        renderer->timingMaxTimedCommandListsPerFrame * renderer->timingMaxLatencyFrames;
+    renderer->timingSampleIDCounter = 0;
+    renderer->timingSubmitSerial = 0;
+    renderer->timingFrameIDCounter = 0;
+    renderer->timingSampleCount = 0;
+    renderer->timingSampleCapacity = 0;
+    renderer->timingSamples = NULL;
+    renderer->timingDeviceGeneration = 1;
+    renderer->timingTimestampPeriod = renderer->physicalDeviceProperties.properties.limits.timestampPeriod;
+    renderer->timingValidBits = 0;
+    renderer->timingQueryPool = VK_NULL_HANDLE;
+    renderer->timingFreeQueryPairs = NULL;
+    renderer->timingFreeQueryPairCount = 0;
+
+    {
+        Uint32 queueFamilyCount = 0;
+        renderer->vkGetPhysicalDeviceQueueFamilyProperties(
+            renderer->physicalDevice,
+            &queueFamilyCount,
+            NULL);
+
+        if (queueFamilyCount > 0) {
+            VkQueueFamilyProperties *queueFamilyProperties = SDL_stack_alloc(VkQueueFamilyProperties, queueFamilyCount);
+            renderer->vkGetPhysicalDeviceQueueFamilyProperties(
+                renderer->physicalDevice,
+                &queueFamilyCount,
+                queueFamilyProperties);
+
+            if (renderer->queueFamilyIndex < queueFamilyCount) {
+                renderer->timingValidBits =
+                    queueFamilyProperties[renderer->queueFamilyIndex].timestampValidBits;
+            }
+
+            SDL_stack_free(queueFamilyProperties);
+        }
+    }
+
+    if (renderer->timingValidBits > 0) {
+        VkQueryPoolCreateInfo queryPoolCreateInfo;
+        queryPoolCreateInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        queryPoolCreateInfo.pNext = NULL;
+        queryPoolCreateInfo.flags = 0;
+        queryPoolCreateInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        queryPoolCreateInfo.queryCount = renderer->timingQueryPairCapacity * 2;
+        queryPoolCreateInfo.pipelineStatistics = 0;
+
+        if (renderer->vkCreateQueryPool(
+                renderer->logicalDevice,
+                &queryPoolCreateInfo,
+                NULL,
+                &renderer->timingQueryPool) == VK_SUCCESS) {
+            renderer->timingFreeQueryPairs = (Uint32 *)SDL_malloc(sizeof(Uint32) * renderer->timingQueryPairCapacity);
+            if (renderer->timingFreeQueryPairs != NULL) {
+                for (Uint32 queryPairIndex = 0; queryPairIndex < renderer->timingQueryPairCapacity; queryPairIndex += 1) {
+                    renderer->timingFreeQueryPairs[queryPairIndex] = renderer->timingQueryPairCapacity - queryPairIndex - 1;
+                }
+                renderer->timingFreeQueryPairCount = renderer->timingQueryPairCapacity;
+            } else {
+                renderer->vkDestroyQueryPool(renderer->logicalDevice, renderer->timingQueryPool, NULL);
+                renderer->timingQueryPool = VK_NULL_HANDLE;
+            }
+        }
+    }
 
     // Deferred destroy storage
 

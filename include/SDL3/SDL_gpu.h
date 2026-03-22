@@ -2607,6 +2607,50 @@ extern SDL_DECLSPEC SDL_GPUShaderFormat SDLCALL SDL_GetGPUShaderFormats(SDL_GPUD
  */
 extern SDL_DECLSPEC SDL_PropertiesID SDLCALL SDL_GetGPUDeviceProperties(SDL_GPUDevice *device);
 
+/**
+ * Get the underlying Metal device for a GPU context.
+ *
+ * This returns a borrowed native handle. SDL retains ownership.
+ *
+ * \param device a GPU context to query.
+ * \returns an `id<MTLDevice>` when the backend is Metal, or NULL otherwise.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available in the Moonbase SDL fork.
+ */
+extern SDL_DECLSPEC void * SDLCALL SDL_GetGPUMetalDevice(SDL_GPUDevice *device);
+
+/**
+ * Get the underlying Metal command buffer for a GPU command buffer.
+ *
+ * This returns a borrowed native handle. SDL retains ownership.
+ *
+ * \param command_buffer a GPU command buffer to query.
+ * \returns an `id<MTLCommandBuffer>` when the backend is Metal, or NULL otherwise.
+ *
+ * \threadsafety This function must be called on the same thread that owns the
+ *               SDL GPU command buffer recording flow.
+ *
+ * \since This function is available in the Moonbase SDL fork.
+ */
+extern SDL_DECLSPEC void * SDLCALL SDL_GetGPUMetalCommandBuffer(SDL_GPUCommandBuffer *command_buffer);
+
+/**
+ * Get the underlying Metal texture for a GPU texture.
+ *
+ * This returns a borrowed native handle. SDL retains ownership.
+ *
+ * \param device the GPU context that owns the texture.
+ * \param texture a GPU texture to query.
+ * \returns an `id<MTLTexture>` when the backend is Metal, or NULL otherwise.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available in the Moonbase SDL fork.
+ */
+extern SDL_DECLSPEC void * SDLCALL SDL_GetGPUMetalTexture(SDL_GPUDevice *device, SDL_GPUTexture *texture);
+
 #define SDL_PROP_GPU_DEVICE_NAME_STRING               "SDL.gpu.device.name"
 #define SDL_PROP_GPU_DEVICE_DRIVER_NAME_STRING        "SDL.gpu.device.driver_name"
 #define SDL_PROP_GPU_DEVICE_DRIVER_VERSION_STRING     "SDL.gpu.device.driver_version"
@@ -4526,6 +4570,223 @@ extern SDL_DECLSPEC bool SDLCALL SDL_QueryGPUFence(
 extern SDL_DECLSPEC void SDLCALL SDL_ReleaseGPUFence(
     SDL_GPUDevice *device,
     SDL_GPUFence *fence);
+
+/**
+ * A GPU command buffer timing result status.
+ *
+ * \since This enum is available since SDL 3.4.0.
+ */
+typedef enum SDL_GPUCommandBufferTimingStatus
+{
+    SDL_GPU_COMMANDBUFFER_TIMING_STATUS_OK,
+    SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY,
+    SDL_GPU_COMMANDBUFFER_TIMING_STATUS_POOL_EXHAUSTED,
+    SDL_GPU_COMMANDBUFFER_TIMING_STATUS_DROPPED,
+    SDL_GPU_COMMANDBUFFER_TIMING_STATUS_BACKEND_ERROR
+} SDL_GPUCommandBufferTimingStatus;
+
+/**
+ * A GPU command list kind.
+ *
+ * \since This enum is available since SDL 3.4.0.
+ */
+typedef enum SDL_GPUCommandListKind
+{
+    SDL_GPU_COMMAND_LIST_KIND_VIEW,
+    SDL_GPU_COMMAND_LIST_KIND_UPLOAD
+} SDL_GPUCommandListKind;
+
+/**
+ * A GPU timing source domain.
+ *
+ * \since This enum is available since SDL 3.4.0.
+ */
+typedef enum SDL_GPUTimeDomain
+{
+    SDL_GPU_TIME_DOMAIN_GPU_TICKS,
+    SDL_GPU_TIME_DOMAIN_GPU_NS,
+    SDL_GPU_TIME_DOMAIN_HOST_SECONDS_CONVERTED
+} SDL_GPUTimeDomain;
+
+/**
+ * Timing capability flags and limits for GPU command buffer timing.
+ *
+ * \since This struct is available since SDL 3.4.0.
+ *
+ * \sa SDL_GetGPUCommandBufferTimingCapabilities
+ */
+typedef struct SDL_GPUCommandBufferTimingCapabilities
+{
+    bool supports_timing;            /**< True when backend timing is available. */
+    bool supports_view_timing;       /**< True when view command-list timing is supported. */
+    bool supports_upload_timing;     /**< True when upload command-list timing is supported. */
+    bool supports_present_telemetry; /**< True when backend present telemetry is available. */
+    Uint32 max_latency_frames;       /**< Liveness bound used for dropped detection. */
+    Uint32 max_frames_in_flight;     /**< Backend max frames in flight. */
+    Uint32 max_timed_command_lists_per_frame; /**< Backend timed command-list budget per frame. */
+} SDL_GPUCommandBufferTimingCapabilities;
+
+/**
+ * Runtime timing configuration for command-buffer timing.
+ *
+ * \since This struct is available since SDL 3.4.0.
+ *
+ * \sa SDL_SetGPUCommandBufferTimingConfig
+ * \sa SDL_GetGPUCommandBufferTimingConfig
+ */
+typedef struct SDL_GPUCommandBufferTimingConfig
+{
+    Uint32 max_latency_frames;                /**< Liveness bound for dropped detection. */
+    Uint32 max_timed_command_lists_per_frame; /**< Timed command-list budget per frame. */
+} SDL_GPUCommandBufferTimingConfig;
+
+/**
+ * A polled GPU command buffer timing result.
+ *
+ * \since This struct is available since SDL 3.4.0.
+ *
+ * \sa SDL_PollGPUCommandBufferTiming
+ */
+typedef struct SDL_GPUCommandBufferTimingResult
+{
+    Uint64 sample_id;                                 /**< Sample identifier returned by SDL_AcquireGPUTimedCommandBuffer. */
+    Uint64 duration_ns;                               /**< Valid when status is SDL_GPU_COMMANDBUFFER_TIMING_STATUS_OK. */
+    SDL_GPUTimeDomain time_domain;                    /**< Backend timing source domain. */
+    Uint64 device_generation;                         /**< Monotonic backend generation. */
+    SDL_GPUCommandBufferTimingStatus status;          /**< Terminal timing status for the sample. */
+} SDL_GPUCommandBufferTimingResult;
+
+/**
+ * Acquires a command buffer with backend-owned timing instrumentation enabled.
+ *
+ * The command buffer behaves like one acquired via SDL_AcquireGPUCommandBuffer,
+ * but is associated with a timing sample id for later polling.
+ *
+ * If timing query resources are exhausted, this still returns a command buffer;
+ * the sample will resolve to SDL_GPU_COMMANDBUFFER_TIMING_STATUS_POOL_EXHAUSTED
+ * after submission.
+ *
+ * \param device a GPU context.
+ * \param sample_id a pointer to receive the timing sample id.
+ * \returns a command buffer, or NULL on failure; call SDL_GetError() for more
+ *          information.
+ *
+ * \since This function is available since SDL 3.4.0.
+ *
+ * \sa SDL_AcquireGPUCommandBuffer
+ * \sa SDL_SubmitGPUCommandBuffer
+ * \sa SDL_PollGPUCommandBufferTiming
+ */
+extern SDL_DECLSPEC SDL_GPUCommandBuffer * SDLCALL SDL_AcquireGPUTimedCommandBuffer(
+    SDL_GPUDevice *device,
+    Uint64 *sample_id);
+
+/**
+ * Begins a timing frame and returns the next backend frame id.
+ *
+ * \param device a GPU context.
+ * \param out_frame_id a pointer to receive the backend timing frame id.
+ * \returns true on success, false on failure; call SDL_GetError() for more
+ *          information.
+ *
+ * \since This function is available since SDL 3.4.0.
+ *
+ * \sa SDL_GetGPUCommandBufferTimingCapabilities
+ */
+extern SDL_DECLSPEC bool SDLCALL SDL_BeginGPUCommandBufferTimingFrame(
+    SDL_GPUDevice *device,
+    Uint64 *out_frame_id);
+
+/**
+ * Sets runtime timing configuration for command-buffer timing.
+ *
+ * \param device a GPU context.
+ * \param config a pointer to timing config values.
+ * \returns true on success, false on failure; call SDL_GetError() for more
+ *          information.
+ *
+ * \since This function is available since SDL 3.4.0.
+ *
+ * \sa SDL_GetGPUCommandBufferTimingConfig
+ */
+extern SDL_DECLSPEC bool SDLCALL SDL_SetGPUCommandBufferTimingConfig(
+    SDL_GPUDevice *device,
+    const SDL_GPUCommandBufferTimingConfig *config);
+
+/**
+ * Gets runtime timing configuration for command-buffer timing.
+ *
+ * \param device a GPU context.
+ * \param config a pointer to receive timing config values.
+ * \returns true on success, false on failure; call SDL_GetError() for more
+ *          information.
+ *
+ * \since This function is available since SDL 3.4.0.
+ *
+ * \sa SDL_SetGPUCommandBufferTimingConfig
+ */
+extern SDL_DECLSPEC bool SDLCALL SDL_GetGPUCommandBufferTimingConfig(
+    SDL_GPUDevice *device,
+    SDL_GPUCommandBufferTimingConfig *config);
+
+/**
+ * Gets GPU command buffer timing capabilities for the current backend/device.
+ *
+ * \param device a GPU context.
+ * \param capabilities a pointer to receive timing capabilities.
+ * \returns true on success, false on failure; call SDL_GetError() for more
+ *          information.
+ *
+ * \since This function is available since SDL 3.4.0.
+ *
+ * \sa SDL_AcquireGPUTimedCommandBuffer
+ * \sa SDL_PollGPUCommandBufferTiming
+ */
+extern SDL_DECLSPEC bool SDLCALL SDL_GetGPUCommandBufferTimingCapabilities(
+    SDL_GPUDevice *device,
+    SDL_GPUCommandBufferTimingCapabilities *capabilities);
+
+/**
+ * Gets the backend timing device generation id.
+ *
+ * \param device a GPU context.
+ * \param out_device_generation a pointer to receive the generation id.
+ * \returns true on success, false on failure; call SDL_GetError() for more
+ *          information.
+ *
+ * \since This function is available since SDL 3.4.0.
+ *
+ * \sa SDL_PollGPUCommandBufferTiming
+ */
+extern SDL_DECLSPEC bool SDLCALL SDL_GetGPUCommandBufferTimingDeviceGeneration(
+    SDL_GPUDevice *device,
+    Uint64 *out_device_generation);
+
+/**
+ * Polls non-blocking terminal timing results for submitted timed command
+ * buffers.
+ *
+ * Results are consumed when returned by this call. A sample is returned at
+ * most once.
+ *
+ * \param device a GPU context.
+ * \param results destination array for timing results, or NULL when
+ *                max_results is 0.
+ * \param max_results max number of results to write.
+ * \param out_result_count receives the number of results written.
+ * \returns true on success, false on failure; call SDL_GetError() for more
+ *          information.
+ *
+ * \since This function is available since SDL 3.4.0.
+ *
+ * \sa SDL_AcquireGPUTimedCommandBuffer
+ * \sa SDL_GetGPUCommandBufferTimingCapabilities
+ */
+extern SDL_DECLSPEC bool SDLCALL SDL_PollGPUCommandBufferTiming(
+    SDL_GPUDevice *device,
+    SDL_GPUCommandBufferTimingResult *results,
+    Uint32 max_results,
+    Uint32 *out_result_count);
 
 /* Format Info */
 

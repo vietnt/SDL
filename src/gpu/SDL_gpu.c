@@ -811,6 +811,33 @@ SDL_PropertiesID SDL_GetGPUDeviceProperties(SDL_GPUDevice *device)
     return device->GetDeviceProperties(device);
 }
 
+void * SDL_GetGPUMetalDevice(SDL_GPUDevice *device)
+{
+    CHECK_DEVICE_MAGIC(device, NULL);
+    return device->GetMetalDevice(device->driverData);
+}
+
+void * SDL_GetGPUMetalCommandBuffer(SDL_GPUCommandBuffer *command_buffer)
+{
+    CHECK_PARAM(command_buffer == NULL) {
+        SDL_InvalidParamError("command_buffer");
+        return NULL;
+    }
+
+    return ((CommandBufferCommonHeader *)command_buffer)->device->GetMetalCommandBuffer(command_buffer);
+}
+
+void * SDL_GetGPUMetalTexture(SDL_GPUDevice *device, SDL_GPUTexture *texture)
+{
+    CHECK_DEVICE_MAGIC(device, NULL);
+    CHECK_PARAM(texture == NULL) {
+        SDL_InvalidParamError("texture");
+        return NULL;
+    }
+
+    return device->GetMetalTexture(device->driverData, texture);
+}
+
 Uint32 SDL_GPUTextureFormatTexelBlockSize(
     SDL_GPUTextureFormat format)
 {
@@ -1671,6 +1698,8 @@ SDL_GPUCommandBuffer *SDL_AcquireGPUCommandBuffer(
     commandBufferHeader->render_pass.command_buffer = command_buffer;
     commandBufferHeader->compute_pass.command_buffer = command_buffer;
     commandBufferHeader->copy_pass.command_buffer = command_buffer;
+    commandBufferHeader->timed = false;
+    commandBufferHeader->timing_sample_id = 0;
 
     if (device->debug_mode) {
         commandBufferHeader->render_pass.in_progress = false;
@@ -1693,6 +1722,39 @@ SDL_GPUCommandBuffer *SDL_AcquireGPUCommandBuffer(
         SDL_zeroa(commandBufferHeader->compute_pass.read_write_storage_texture_bound);
         SDL_zeroa(commandBufferHeader->compute_pass.read_write_storage_buffer_bound);
     }
+
+    return command_buffer;
+}
+
+SDL_GPUCommandBuffer *SDL_AcquireGPUTimedCommandBuffer(
+    SDL_GPUDevice *device,
+    Uint64 *sample_id)
+{
+    SDL_GPUCommandBuffer *command_buffer;
+    CommandBufferCommonHeader *commandBufferHeader;
+
+    CHECK_DEVICE_MAGIC(device, NULL);
+
+    CHECK_PARAM(sample_id == NULL) {
+        SDL_InvalidParamError("sample_id");
+        return NULL;
+    }
+
+    command_buffer = SDL_AcquireGPUCommandBuffer(device);
+    if (command_buffer == NULL) {
+        return NULL;
+    }
+
+    if (!device->AcquireTimedCommandBuffer(
+            command_buffer,
+            sample_id)) {
+        (void)device->Cancel(command_buffer);
+        return NULL;
+    }
+
+    commandBufferHeader = (CommandBufferCommonHeader *)command_buffer;
+    commandBufferHeader->timed = true;
+    commandBufferHeader->timing_sample_id = *sample_id;
 
     return command_buffer;
 }
@@ -3546,6 +3608,110 @@ void SDL_ReleaseGPUFence(
     device->ReleaseFence(
         device->driverData,
         fence);
+}
+
+bool SDL_GetGPUCommandBufferTimingCapabilities(
+    SDL_GPUDevice *device,
+    SDL_GPUCommandBufferTimingCapabilities *capabilities)
+{
+    CHECK_DEVICE_MAGIC(device, false);
+
+    CHECK_PARAM(capabilities == NULL) {
+        SDL_InvalidParamError("capabilities");
+        return false;
+    }
+
+    return device->GetCommandBufferTimingCapabilities(
+        device->driverData,
+        capabilities);
+}
+
+bool SDL_BeginGPUCommandBufferTimingFrame(
+    SDL_GPUDevice *device,
+    Uint64 *out_frame_id)
+{
+    CHECK_DEVICE_MAGIC(device, false);
+
+    CHECK_PARAM(out_frame_id == NULL) {
+        SDL_InvalidParamError("out_frame_id");
+        return false;
+    }
+
+    return device->BeginCommandBufferTimingFrame(
+        device->driverData,
+        out_frame_id);
+}
+
+bool SDL_SetGPUCommandBufferTimingConfig(
+    SDL_GPUDevice *device,
+    const SDL_GPUCommandBufferTimingConfig *config)
+{
+    CHECK_DEVICE_MAGIC(device, false);
+
+    CHECK_PARAM(config == NULL) {
+        SDL_InvalidParamError("config");
+        return false;
+    }
+
+    return device->SetCommandBufferTimingConfig(
+        device->driverData,
+        config);
+}
+
+bool SDL_GetGPUCommandBufferTimingConfig(
+    SDL_GPUDevice *device,
+    SDL_GPUCommandBufferTimingConfig *config)
+{
+    CHECK_DEVICE_MAGIC(device, false);
+
+    CHECK_PARAM(config == NULL) {
+        SDL_InvalidParamError("config");
+        return false;
+    }
+
+    return device->GetCommandBufferTimingConfig(
+        device->driverData,
+        config);
+}
+
+bool SDL_GetGPUCommandBufferTimingDeviceGeneration(
+    SDL_GPUDevice *device,
+    Uint64 *out_device_generation)
+{
+    CHECK_DEVICE_MAGIC(device, false);
+
+    CHECK_PARAM(out_device_generation == NULL) {
+        SDL_InvalidParamError("out_device_generation");
+        return false;
+    }
+
+    return device->GetCommandBufferTimingDeviceGeneration(
+        device->driverData,
+        out_device_generation);
+}
+
+bool SDL_PollGPUCommandBufferTiming(
+    SDL_GPUDevice *device,
+    SDL_GPUCommandBufferTimingResult *results,
+    Uint32 max_results,
+    Uint32 *out_result_count)
+{
+    CHECK_DEVICE_MAGIC(device, false);
+
+    CHECK_PARAM(out_result_count == NULL) {
+        SDL_InvalidParamError("out_result_count");
+        return false;
+    }
+    CHECK_PARAM(results == NULL && max_results > 0) {
+        SDL_InvalidParamError("results");
+        return false;
+    }
+
+    return device->PollCommandBufferTiming(
+        device->driverData,
+        results,
+        max_results,
+        out_result_count);
 }
 
 Uint32 SDL_CalculateGPUTextureFormatSize(

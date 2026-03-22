@@ -38,6 +38,7 @@
 
 #define METAL_FIRST_VERTEX_BUFFER_SLOT 14
 #define WINDOW_PROPERTY_DATA           "SDL.internal.gpu.metal.data"
+#define METAL_TIMING_MAX_TIMED_COMMAND_LISTS_PER_FRAME 1024
 #define SDL_GPU_SHADERSTAGE_COMPUTE    2
 
 #define TRACK_RESOURCE(resource, type, array, count, capacity)   \
@@ -457,6 +458,18 @@ typedef struct MetalFence
     SDL_AtomicInt referenceCount;
 } MetalFence;
 
+typedef struct MetalTimingSample
+{
+    Uint64 sampleID;
+    SDL_GPUCommandBufferTimingStatus status;
+    SDL_GPUTimeDomain timeDomain;
+    Uint64 durationNS;
+    Uint64 deviceGeneration;
+    Uint64 frameID;
+    Uint64 submitSerial;
+    bool submitted;
+} MetalTimingSample;
+
 typedef struct MetalWindowData
 {
     SDL_Window *window;
@@ -658,6 +671,17 @@ struct MetalRenderer
     Uint32 availableFenceCount;
     Uint32 availableFenceCapacity;
 
+    MetalTimingSample *timingSamples;
+    Uint32 timingSampleCount;
+    Uint32 timingSampleCapacity;
+    Uint64 timingSampleIDCounter;
+    Uint64 timingSubmitSerial;
+    Uint64 timingFrameIDCounter;
+    Uint64 timingDeviceGeneration;
+    Uint32 timingMaxLatencyFrames;
+    Uint32 timingMaxTimedCommandListsPerFrame;
+    SDL_Mutex *timingLock;
+
     MetalUniformBuffer **uniformBufferPool;
     Uint32 uniformBufferPoolCount;
     Uint32 uniformBufferPoolCapacity;
@@ -702,6 +726,78 @@ static inline Uint32 METAL_INTERNAL_NextHighestAlignment(
     Uint32 align)
 {
     return align * ((n + align - 1) / align);
+}
+
+static bool METAL_INTERNAL_EnsureTimingSampleCapacity(
+    MetalRenderer *renderer,
+    Uint32 requiredCount)
+{
+    if (requiredCount <= renderer->timingSampleCapacity) {
+        return true;
+    }
+
+    Uint32 newCapacity = renderer->timingSampleCapacity == 0 ? 16 : renderer->timingSampleCapacity;
+    while (newCapacity < requiredCount) {
+        newCapacity *= 2;
+    }
+
+    MetalTimingSample *resized = (MetalTimingSample *)SDL_realloc(
+        renderer->timingSamples,
+        sizeof(MetalTimingSample) * newCapacity);
+
+    if (resized == NULL) {
+        return SDL_OutOfMemory();
+    }
+
+    renderer->timingSamples = resized;
+    renderer->timingSampleCapacity = newCapacity;
+    return true;
+}
+
+static Sint32 METAL_INTERNAL_FindTimingSampleIndex(
+    MetalRenderer *renderer,
+    Uint64 sampleID)
+{
+    for (Uint32 i = 0; i < renderer->timingSampleCount; i += 1) {
+        if (renderer->timingSamples[i].sampleID == sampleID) {
+            return (Sint32)i;
+        }
+    }
+
+    return -1;
+}
+
+static void METAL_INTERNAL_RemoveTimingSampleByIndex(
+    MetalRenderer *renderer,
+    Uint32 index)
+{
+    if (index >= renderer->timingSampleCount) {
+        return;
+    }
+
+    renderer->timingSampleCount -= 1;
+    if (index != renderer->timingSampleCount) {
+        renderer->timingSamples[index] = renderer->timingSamples[renderer->timingSampleCount];
+    }
+}
+
+static void METAL_INTERNAL_AbortTimingForCommandBuffer(
+    MetalRenderer *renderer,
+    MetalCommandBuffer *commandBuffer)
+{
+    if (!commandBuffer->common.timed || commandBuffer->common.timing_sample_id == 0) {
+        return;
+    }
+
+    SDL_LockMutex(renderer->timingLock);
+    Sint32 sampleIndex = METAL_INTERNAL_FindTimingSampleIndex(renderer, commandBuffer->common.timing_sample_id);
+    if (sampleIndex >= 0) {
+        METAL_INTERNAL_RemoveTimingSampleByIndex(renderer, (Uint32)sampleIndex);
+    }
+    SDL_UnlockMutex(renderer->timingLock);
+
+    commandBuffer->common.timed = false;
+    commandBuffer->common.timing_sample_id = 0;
 }
 
 // Quit
@@ -751,6 +847,10 @@ static void METAL_DestroyDevice(SDL_GPUDevice *device)
     }
     SDL_free(renderer->availableFences);
 
+    renderer->timingSampleCount = 0;
+    SDL_free(renderer->timingSamples);
+    renderer->timingSamples = NULL;
+
     // Release the mutexes
     SDL_DestroyMutex(renderer->submitLock);
     SDL_DestroyMutex(renderer->acquireCommandBufferLock);
@@ -758,6 +858,7 @@ static void METAL_DestroyDevice(SDL_GPUDevice *device)
     SDL_DestroyMutex(renderer->disposeLock);
     SDL_DestroyMutex(renderer->fenceLock);
     SDL_DestroyMutex(renderer->windowLock);
+    SDL_DestroyMutex(renderer->timingLock);
 
     // Release the command queue
     renderer->queue = nil;
@@ -2206,6 +2307,213 @@ static SDL_GPUCommandBuffer *METAL_AcquireCommandBuffer(
 
         return (SDL_GPUCommandBuffer *)commandBuffer;
     }
+}
+
+static bool METAL_INTERNAL_CommandBufferTimingAvailable(MetalRenderer *renderer)
+{
+    if (renderer->queue == nil) {
+        return false;
+    }
+
+    id<MTLCommandBuffer> probe = [renderer->queue commandBuffer];
+    if (probe == nil) {
+        return false;
+    }
+
+    return [probe respondsToSelector:@selector(GPUStartTime)] &&
+           [probe respondsToSelector:@selector(GPUEndTime)];
+}
+
+static bool METAL_AcquireTimedCommandBuffer(
+    SDL_GPUCommandBuffer *commandBuffer,
+    Uint64 *sampleID)
+{
+    MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
+    MetalRenderer *renderer = metalCommandBuffer->renderer;
+    MetalTimingSample sample;
+
+    if (!METAL_INTERNAL_CommandBufferTimingAvailable(renderer)) {
+        return SDL_SetError("Metal command buffer timing is unavailable");
+    }
+
+    SDL_zero(sample);
+
+    SDL_LockMutex(renderer->timingLock);
+
+    if (!METAL_INTERNAL_EnsureTimingSampleCapacity(renderer, renderer->timingSampleCount + 1)) {
+        SDL_UnlockMutex(renderer->timingLock);
+        return false;
+    }
+
+    renderer->timingSampleIDCounter += 1;
+    if (renderer->timingSampleIDCounter == 0) {
+        renderer->timingSampleIDCounter = 1;
+    }
+
+    sample.sampleID = renderer->timingSampleIDCounter;
+    sample.status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY;
+    sample.timeDomain = SDL_GPU_TIME_DOMAIN_HOST_SECONDS_CONVERTED;
+    sample.durationNS = 0;
+    sample.deviceGeneration = renderer->timingDeviceGeneration;
+    sample.frameID = renderer->timingFrameIDCounter;
+    sample.submitSerial = 0;
+    sample.submitted = false;
+
+    renderer->timingSamples[renderer->timingSampleCount] = sample;
+    renderer->timingSampleCount += 1;
+
+    *sampleID = sample.sampleID;
+
+    SDL_UnlockMutex(renderer->timingLock);
+
+    return true;
+}
+
+static bool METAL_BeginCommandBufferTimingFrame(
+    SDL_GPURenderer *driverData,
+    Uint64 *outFrameID)
+{
+    MetalRenderer *renderer = (MetalRenderer *)driverData;
+
+    SDL_LockMutex(renderer->timingLock);
+    renderer->timingFrameIDCounter += 1;
+    if (renderer->timingFrameIDCounter == 0) {
+        renderer->timingFrameIDCounter = 1;
+    }
+    *outFrameID = renderer->timingFrameIDCounter;
+    SDL_UnlockMutex(renderer->timingLock);
+
+    return true;
+}
+
+static bool METAL_SetCommandBufferTimingConfig(
+    SDL_GPURenderer *driverData,
+    const SDL_GPUCommandBufferTimingConfig *config)
+{
+    MetalRenderer *renderer = (MetalRenderer *)driverData;
+    Uint32 minLatencyFrames = SDL_max(3, renderer->allowedFramesInFlight + 1);
+
+    if (config->max_latency_frames < minLatencyFrames) {
+        return SDL_SetError("Metal timing config max_latency_frames must be >= %u", minLatencyFrames);
+    }
+
+    if (config->max_timed_command_lists_per_frame == 0) {
+        return SDL_SetError("Metal timing config max_timed_command_lists_per_frame must be > 0");
+    }
+
+    if (config->max_timed_command_lists_per_frame > METAL_TIMING_MAX_TIMED_COMMAND_LISTS_PER_FRAME) {
+        return SDL_SetError("Metal timing config max_timed_command_lists_per_frame exceeds backend limit %u", METAL_TIMING_MAX_TIMED_COMMAND_LISTS_PER_FRAME);
+    }
+
+    SDL_LockMutex(renderer->timingLock);
+    renderer->timingMaxLatencyFrames = config->max_latency_frames;
+    renderer->timingMaxTimedCommandListsPerFrame = config->max_timed_command_lists_per_frame;
+    SDL_UnlockMutex(renderer->timingLock);
+
+    return true;
+}
+
+static bool METAL_GetCommandBufferTimingConfig(
+    SDL_GPURenderer *driverData,
+    SDL_GPUCommandBufferTimingConfig *config)
+{
+    MetalRenderer *renderer = (MetalRenderer *)driverData;
+
+    SDL_LockMutex(renderer->timingLock);
+    config->max_latency_frames = renderer->timingMaxLatencyFrames;
+    config->max_timed_command_lists_per_frame = renderer->timingMaxTimedCommandListsPerFrame;
+    SDL_UnlockMutex(renderer->timingLock);
+
+    return true;
+}
+
+static bool METAL_GetCommandBufferTimingCapabilities(
+    SDL_GPURenderer *driverData,
+    SDL_GPUCommandBufferTimingCapabilities *capabilities)
+{
+    MetalRenderer *renderer = (MetalRenderer *)driverData;
+    bool supported = METAL_INTERNAL_CommandBufferTimingAvailable(renderer);
+
+    SDL_zero(*capabilities);
+
+    capabilities->supports_timing = supported;
+    capabilities->supports_view_timing = supported;
+    capabilities->supports_upload_timing = supported;
+    capabilities->supports_present_telemetry = false;
+    capabilities->max_latency_frames = renderer->timingMaxLatencyFrames;
+    capabilities->max_frames_in_flight = renderer->allowedFramesInFlight;
+    capabilities->max_timed_command_lists_per_frame = renderer->timingMaxTimedCommandListsPerFrame;
+
+    return true;
+}
+
+static bool METAL_GetCommandBufferTimingDeviceGeneration(
+    SDL_GPURenderer *driverData,
+    Uint64 *outDeviceGeneration)
+{
+    MetalRenderer *renderer = (MetalRenderer *)driverData;
+
+    SDL_LockMutex(renderer->timingLock);
+    *outDeviceGeneration = renderer->timingDeviceGeneration;
+    SDL_UnlockMutex(renderer->timingLock);
+
+    return true;
+}
+
+static bool METAL_PollCommandBufferTiming(
+    SDL_GPURenderer *driverData,
+    SDL_GPUCommandBufferTimingResult *results,
+    Uint32 maxResults,
+    Uint32 *outResultCount)
+{
+    MetalRenderer *renderer = (MetalRenderer *)driverData;
+    Uint32 emitted = 0;
+    Uint64 currentFrameID;
+
+    *outResultCount = 0;
+
+    if (maxResults == 0) {
+        return true;
+    }
+
+    SDL_LockMutex(renderer->timingLock);
+
+    currentFrameID = renderer->timingFrameIDCounter;
+
+    Uint32 sampleIndex = 0;
+    while (sampleIndex < renderer->timingSampleCount && emitted < maxResults) {
+        MetalTimingSample *sample = &renderer->timingSamples[sampleIndex];
+        bool terminal = false;
+
+        if (sample->submitted && sample->status == SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY &&
+            currentFrameID > sample->frameID &&
+            (currentFrameID - sample->frameID) > renderer->timingMaxLatencyFrames) {
+            sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_DROPPED;
+        }
+
+        terminal = sample->submitted &&
+            sample->status != SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY;
+
+        if (terminal) {
+            SDL_GPUCommandBufferTimingResult *result = &results[emitted];
+            result->sample_id = sample->sampleID;
+            result->duration_ns = sample->durationNS;
+            result->time_domain = sample->timeDomain;
+            result->device_generation = sample->deviceGeneration;
+            result->status = sample->status;
+            emitted += 1;
+
+            METAL_INTERNAL_RemoveTimingSampleByIndex(renderer, sampleIndex);
+            continue;
+        }
+
+        sampleIndex += 1;
+    }
+
+    SDL_UnlockMutex(renderer->timingLock);
+
+    *outResultCount = emitted;
+    return true;
 }
 
 // This function assumes that it's called from within an autorelease pool
@@ -4091,6 +4399,7 @@ static bool METAL_SetAllowedFramesInFlight(
         }
 
         renderer->allowedFramesInFlight = allowedFramesInFlight;
+        renderer->timingMaxLatencyFrames = SDL_max(3, allowedFramesInFlight + 1);
         return true;
     }
 }
@@ -4107,6 +4416,7 @@ static bool METAL_Submit(
         SDL_LockMutex(renderer->submitLock);
 
         if (!METAL_INTERNAL_AcquireFence(renderer, metalCommandBuffer)) {
+            METAL_INTERNAL_AbortTimingForCommandBuffer(renderer, metalCommandBuffer);
             SDL_UnlockMutex(renderer->submitLock);
             return false;
         }
@@ -4124,9 +4434,55 @@ static bool METAL_Submit(
             windowData->frameCounter = (windowData->frameCounter + 1) % renderer->allowedFramesInFlight;
         }
 
+        if (metalCommandBuffer->common.timed && metalCommandBuffer->common.timing_sample_id != 0) {
+            SDL_LockMutex(renderer->timingLock);
+            Sint32 sampleIndex = METAL_INTERNAL_FindTimingSampleIndex(renderer, metalCommandBuffer->common.timing_sample_id);
+            if (sampleIndex >= 0) {
+                MetalTimingSample *sample = &renderer->timingSamples[sampleIndex];
+                sample->submitted = true;
+                renderer->timingSubmitSerial += 1;
+                sample->submitSerial = renderer->timingSubmitSerial;
+            }
+            SDL_UnlockMutex(renderer->timingLock);
+        }
+
+        Uint64 timingSampleID = metalCommandBuffer->common.timing_sample_id;
+        MetalRenderer *capturedRenderer = renderer;
+        MetalFence *capturedFence = metalCommandBuffer->fence;
+
         // Notify the fence when the command buffer has completed
         [metalCommandBuffer->handle addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
-          SDL_AtomicIncRef(&metalCommandBuffer->fence->complete);
+          SDL_AtomicIncRef(&capturedFence->complete);
+
+          if (timingSampleID != 0) {
+              SDL_LockMutex(capturedRenderer->timingLock);
+              Sint32 sampleIndex = METAL_INTERNAL_FindTimingSampleIndex(capturedRenderer, timingSampleID);
+              if (sampleIndex >= 0) {
+                  MetalTimingSample *sample = &capturedRenderer->timingSamples[sampleIndex];
+
+                  if (sample->submitted && sample->status == SDL_GPU_COMMANDBUFFER_TIMING_STATUS_NOT_READY) {
+                      if ([buffer respondsToSelector:@selector(GPUStartTime)] &&
+                          [buffer respondsToSelector:@selector(GPUEndTime)] &&
+                          buffer.GPUStartTime > 0.0 &&
+                          buffer.GPUEndTime >= buffer.GPUStartTime) {
+                          double durationSeconds = buffer.GPUEndTime - buffer.GPUStartTime;
+                          double durationNS = durationSeconds * 1000000000.0;
+
+                          if (durationNS >= 0.0 && durationNS <= (double)SDL_MAX_UINT64) {
+                              sample->durationNS = (Uint64)durationNS;
+                              sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_OK;
+                          } else {
+                              sample->durationNS = 0;
+                              sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_BACKEND_ERROR;
+                          }
+                      } else {
+                          sample->durationNS = 0;
+                          sample->status = SDL_GPU_COMMANDBUFFER_TIMING_STATUS_BACKEND_ERROR;
+                      }
+                  }
+              }
+              SDL_UnlockMutex(capturedRenderer->timingLock);
+          }
         }];
 
         // Submit the command buffer
@@ -4179,6 +4535,8 @@ static bool METAL_Cancel(
     MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
     MetalRenderer *renderer = metalCommandBuffer->renderer;
 
+    METAL_INTERNAL_AbortTimingForCommandBuffer(renderer, metalCommandBuffer);
+
     metalCommandBuffer->autoReleaseFence = false;
     SDL_LockMutex(renderer->submitLock);
     METAL_INTERNAL_CleanCommandBuffer(renderer, metalCommandBuffer, true);
@@ -4216,6 +4574,39 @@ static bool METAL_Wait(
         SDL_UnlockMutex(renderer->submitLock);
 
         return true;
+    }
+}
+
+static void *METAL_GetMetalDevice(
+    SDL_GPURenderer *driverData)
+{
+    @autoreleasepool {
+        MetalRenderer *renderer = (MetalRenderer *)driverData;
+        return (__bridge void *)renderer->device;
+    }
+}
+
+static void *METAL_GetMetalCommandBuffer(
+    SDL_GPUCommandBuffer *commandBuffer)
+{
+    @autoreleasepool {
+        MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
+        return (__bridge void *)metalCommandBuffer->handle;
+    }
+}
+
+static void *METAL_GetMetalTexture(
+    SDL_GPURenderer *driverData,
+    SDL_GPUTexture *texture)
+{
+    @autoreleasepool {
+        (void)driverData;
+        MetalTextureContainer *container = (MetalTextureContainer *)texture;
+        if (container->activeTexture == NULL) {
+            return NULL;
+        }
+
+        return (__bridge void *)container->activeTexture->handle;
     }
 }
 
@@ -4679,6 +5070,15 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
         // Remember debug mode
         renderer->debugMode = debugMode;
         renderer->allowedFramesInFlight = 2;
+        renderer->timingSampleCount = 0;
+        renderer->timingSampleCapacity = 0;
+        renderer->timingSamples = NULL;
+        renderer->timingSampleIDCounter = 0;
+        renderer->timingSubmitSerial = 0;
+        renderer->timingFrameIDCounter = 0;
+        renderer->timingDeviceGeneration = 1;
+        renderer->timingMaxTimedCommandListsPerFrame = METAL_TIMING_MAX_TIMED_COMMAND_LISTS_PER_FRAME;
+        renderer->timingMaxLatencyFrames = SDL_max(3, MAX_FRAMES_IN_FLIGHT + 1);
 
         // Set up colorspace array
         SwapchainCompositionToColorSpace[0] = kCGColorSpaceSRGB;
@@ -4697,6 +5097,7 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
         renderer->disposeLock = SDL_CreateMutex();
         renderer->fenceLock = SDL_CreateMutex();
         renderer->windowLock = SDL_CreateMutex();
+        renderer->timingLock = SDL_CreateMutex();
 
         // Create command buffer pool
         METAL_INTERNAL_AllocateCommandBuffers(renderer, 2);
