@@ -90,6 +90,8 @@ typedef struct CommandBufferCommonHeader
     Pass copy_pass;
     bool swapchain_texture_acquired;
     bool submitted;
+    bool timed;
+    Uint64 timing_sample_id;
     // used to avoid tripping assert on GenerateMipmaps
     bool ignore_render_pass_texture_validation;
 } CommandBufferCommonHeader;
@@ -671,6 +673,16 @@ struct SDL_GPUDevice
 
     SDL_PropertiesID (*GetDeviceProperties)(SDL_GPUDevice *device);
 
+    void *(*GetMetalDevice)(
+        SDL_GPURenderer *driverData);
+
+    void *(*GetMetalCommandBuffer)(
+        SDL_GPUCommandBuffer *commandBuffer);
+
+    void *(*GetMetalTexture)(
+        SDL_GPURenderer *driverData,
+        SDL_GPUTexture *texture);
+
     // State Creation
 
     SDL_GPUComputePipeline *(*CreateComputePipeline)(
@@ -1034,6 +1046,22 @@ struct SDL_GPUDevice
     SDL_GPUCommandBuffer *(*AcquireCommandBuffer)(
         SDL_GPURenderer *driverData);
 
+    bool (*AcquireTimedCommandBuffer)(
+        SDL_GPUCommandBuffer *commandBuffer,
+        Uint64 *sampleID);
+
+    bool (*BeginCommandBufferTimingFrame)(
+        SDL_GPURenderer *driverData,
+        Uint64 *outFrameID);
+
+    bool (*SetCommandBufferTimingConfig)(
+        SDL_GPURenderer *driverData,
+        const SDL_GPUCommandBufferTimingConfig *config);
+
+    bool (*GetCommandBufferTimingConfig)(
+        SDL_GPURenderer *driverData,
+        SDL_GPUCommandBufferTimingConfig *config);
+
     bool (*AcquireSwapchainTexture)(
         SDL_GPUCommandBuffer *commandBuffer,
         SDL_Window *window,
@@ -1078,6 +1106,20 @@ struct SDL_GPUDevice
         SDL_GPURenderer *driverData,
         SDL_GPUFence *fence);
 
+    bool (*GetCommandBufferTimingCapabilities)(
+        SDL_GPURenderer *driverData,
+        SDL_GPUCommandBufferTimingCapabilities *capabilities);
+
+    bool (*GetCommandBufferTimingDeviceGeneration)(
+        SDL_GPURenderer *driverData,
+        Uint64 *outDeviceGeneration);
+
+    bool (*PollCommandBufferTiming)(
+        SDL_GPURenderer *driverData,
+        SDL_GPUCommandBufferTimingResult *results,
+        Uint32 maxResults,
+        Uint32 *outResultCount);
+
     // Feature Queries
 
     bool (*SupportsTextureFormat)(
@@ -1114,6 +1156,9 @@ struct SDL_GPUDevice
 #define ASSIGN_DRIVER(name)                                 \
     ASSIGN_DRIVER_FUNC(DestroyDevice, name)                 \
     ASSIGN_DRIVER_FUNC(GetDeviceProperties, name)      \
+    ASSIGN_DRIVER_FUNC(GetMetalDevice, name)                \
+    ASSIGN_DRIVER_FUNC(GetMetalCommandBuffer, name)         \
+    ASSIGN_DRIVER_FUNC(GetMetalTexture, name)               \
     ASSIGN_DRIVER_FUNC(CreateComputePipeline, name)         \
     ASSIGN_DRIVER_FUNC(CreateGraphicsPipeline, name)        \
     ASSIGN_DRIVER_FUNC(CreateSampler, name)                 \
@@ -1184,6 +1229,10 @@ struct SDL_GPUDevice
     ASSIGN_DRIVER_FUNC(SetAllowedFramesInFlight, name)      \
     ASSIGN_DRIVER_FUNC(GetSwapchainTextureFormat, name)     \
     ASSIGN_DRIVER_FUNC(AcquireCommandBuffer, name)          \
+    ASSIGN_DRIVER_FUNC(AcquireTimedCommandBuffer, name)     \
+    ASSIGN_DRIVER_FUNC(BeginCommandBufferTimingFrame, name) \
+    ASSIGN_DRIVER_FUNC(SetCommandBufferTimingConfig, name)  \
+    ASSIGN_DRIVER_FUNC(GetCommandBufferTimingConfig, name)  \
     ASSIGN_DRIVER_FUNC(AcquireSwapchainTexture, name)       \
     ASSIGN_DRIVER_FUNC(WaitForSwapchain, name)              \
     ASSIGN_DRIVER_FUNC(WaitAndAcquireSwapchainTexture, name)\
@@ -1194,6 +1243,9 @@ struct SDL_GPUDevice
     ASSIGN_DRIVER_FUNC(WaitForFences, name)                 \
     ASSIGN_DRIVER_FUNC(QueryFence, name)                    \
     ASSIGN_DRIVER_FUNC(ReleaseFence, name)                  \
+    ASSIGN_DRIVER_FUNC(GetCommandBufferTimingCapabilities, name) \
+    ASSIGN_DRIVER_FUNC(GetCommandBufferTimingDeviceGeneration, name) \
+    ASSIGN_DRIVER_FUNC(PollCommandBufferTiming, name)       \
     ASSIGN_DRIVER_FUNC(SupportsTextureFormat, name)         \
     ASSIGN_DRIVER_FUNC(SupportsSampleCount, name)
 

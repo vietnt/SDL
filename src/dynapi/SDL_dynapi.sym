@@ -4,6 +4,7 @@ SDL3_0.0.0 {
     SDL_DYNAPI_entry;
     SDL_AcquireCameraFrame;
     SDL_AcquireGPUCommandBuffer;
+    SDL_AcquireGPUTimedCommandBuffer;
     SDL_AcquireGPUSwapchainTexture;
     SDL_AddAtomicInt;
     SDL_AddEventWatch;
@@ -17,6 +18,7 @@ SDL3_0.0.0 {
     SDL_AddVulkanRenderSemaphores;
     SDL_AttachVirtualJoystick;
     SDL_AudioDevicePaused;
+    SDL_BeginGPUCommandBufferTimingFrame;
     SDL_BeginGPUComputePass;
     SDL_BeginGPUCopyPass;
     SDL_BeginGPURenderPass;
@@ -289,8 +291,14 @@ SDL3_0.0.0 {
     SDL_GetGDKDefaultUser;
     SDL_GetGDKTaskQueue;
     SDL_GetGPUDeviceDriver;
+    SDL_GetGPUMetalCommandBuffer;
+    SDL_GetGPUMetalDevice;
+    SDL_GetGPUMetalTexture;
     SDL_GetGPUDriver;
     SDL_GetGPUShaderFormats;
+    SDL_GetGPUCommandBufferTimingCapabilities;
+    SDL_GetGPUCommandBufferTimingConfig;
+    SDL_GetGPUCommandBufferTimingDeviceGeneration;
     SDL_GetGPUSwapchainTextureFormat;
     SDL_GetGamepadAppleSFSymbolsNameForAxis;
     SDL_GetGamepadAppleSFSymbolsNameForButton;
@@ -676,6 +684,7 @@ SDL3_0.0.0 {
     SDL_PeepEvents;
     SDL_PlayHapticRumble;
     SDL_PollEvent;
+    SDL_PollGPUCommandBufferTiming;
     SDL_PopGPUDebugGroup;
     SDL_PremultiplyAlpha;
     SDL_PremultiplySurfaceAlpha;
@@ -806,6 +815,7 @@ SDL3_0.0.0 {
     SDL_SetFloatProperty;
     SDL_SetGPUBlendConstants;
     SDL_SetGPUBufferName;
+    SDL_SetGPUCommandBufferTimingConfig;
     SDL_SetGPUScissor;
     SDL_SetGPUStencilReference;
     SDL_SetGPUSwapchainParameters;
