@@ -441,6 +441,7 @@ typedef struct MetalTexture
 typedef struct MetalTextureContainer
 {
     TextureCommonHeader header;
+    MetalRenderer *renderer;
 
     MetalTexture *activeTexture;
     Uint8 canBeCycled;
@@ -1625,6 +1626,7 @@ static SDL_GPUTexture *METAL_CreateTexture(
         }
 
         container = SDL_calloc(1, sizeof(MetalTextureContainer));
+        container->renderer = renderer;
         container->canBeCycled = 1;
 
         // Copy properties so we don't lose information when the client destroys them
@@ -4600,8 +4602,12 @@ static void *METAL_GetMetalTexture(
     SDL_GPUTexture *texture)
 {
     @autoreleasepool {
-        (void)driverData;
+        MetalRenderer *renderer = (MetalRenderer *)driverData;
         MetalTextureContainer *container = (MetalTextureContainer *)texture;
+        if (container->renderer != renderer) {
+            SDL_SetError("Texture does not belong to this device");
+            return NULL;
+        }
         if (container->activeTexture == NULL) {
             return NULL;
         }

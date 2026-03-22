@@ -2625,6 +2625,7 @@ extern SDL_DECLSPEC void * SDLCALL SDL_GetGPUMetalDevice(SDL_GPUDevice *device);
  * Get the underlying Metal command buffer for a GPU command buffer.
  *
  * This returns a borrowed native handle. SDL retains ownership.
+ * The returned handle is only valid before SDL commits the command buffer.
  *
  * \param command_buffer a GPU command buffer to query.
  * \returns an `id<MTLCommandBuffer>` when the backend is Metal, or NULL otherwise.
@@ -2643,7 +2644,8 @@ extern SDL_DECLSPEC void * SDLCALL SDL_GetGPUMetalCommandBuffer(SDL_GPUCommandBu
  *
  * \param device the GPU context that owns the texture.
  * \param texture a GPU texture to query.
- * \returns an `id<MTLTexture>` when the backend is Metal, or NULL otherwise.
+ * \returns an `id<MTLTexture>` when the backend is Metal and the texture belongs
+ *          to `device`, or NULL otherwise.
  *
  * \threadsafety It is safe to call this function from any thread.
  *
