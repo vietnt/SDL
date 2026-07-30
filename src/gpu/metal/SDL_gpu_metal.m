@@ -1868,6 +1868,12 @@ static MetalBuffer *METAL_INTERNAL_PrepareBufferForWrite(
     Uint32 i;
 
     // Cycle if needed
+    if (cycle && SDL_GetAtomicInt(&container->activeBuffer->referenceCount) == 0) {
+        // The active backing is being reused in place; an oversized
+        // container would otherwise never pass through the scan below and
+        // would keep its burst surplus forever (Rome vietnt/Rome#411).
+        METAL_INTERNAL_TrimCycledBuffers(container, container->activeBuffer);
+    }
     if (cycle && SDL_GetAtomicInt(&container->activeBuffer->referenceCount) > 0) {
         for (i = 0; i < container->bufferCount; i += 1) {
             if (SDL_GetAtomicInt(&container->buffers[i]->referenceCount) == 0) {
