@@ -1652,6 +1652,54 @@ static SDL_GPUTexture *METAL_CreateTexture(
     }
 }
 
+// Rome vietnt/Rome#411: cycled containers grow one backing per cycle while
+// every backing is referenced (in-flight bursts), and stock SDL only frees
+// backings at container destroy — a per-frame-cycled render target keeps its
+// burst high-water forever. Cap the pool instead: whenever the cycle scan
+// finds an idle backing to hand out, free OTHER backings that pass the same
+// refcount==0 test until the container is back at the cap. No new liveness
+// judgment is introduced — refcount==0 is exactly the test reuse trusts to
+// overwrite a backing's contents.
+#define METAL_INTERNAL_CYCLE_BACKING_CAP 4
+
+static void METAL_INTERNAL_TrimCycledTextures(
+    MetalTextureContainer *container,
+    MetalTexture *keep)
+{
+    Uint32 i = 0;
+    while (container->textureCount > METAL_INTERNAL_CYCLE_BACKING_CAP &&
+           i < container->textureCount) {
+        MetalTexture *texture = container->textures[i];
+        if (texture != keep && SDL_GetAtomicInt(&texture->referenceCount) == 0) {
+            texture->handle = nil;
+            SDL_free(texture);
+            container->textureCount -= 1;
+            container->textures[i] = container->textures[container->textureCount];
+            continue; // re-examine the swapped-in entry
+        }
+        i += 1;
+    }
+}
+
+static void METAL_INTERNAL_TrimCycledBuffers(
+    MetalBufferContainer *container,
+    MetalBuffer *keep)
+{
+    Uint32 i = 0;
+    while (container->bufferCount > METAL_INTERNAL_CYCLE_BACKING_CAP &&
+           i < container->bufferCount) {
+        MetalBuffer *buffer = container->buffers[i];
+        if (buffer != keep && SDL_GetAtomicInt(&buffer->referenceCount) == 0) {
+            buffer->handle = nil;
+            SDL_free(buffer);
+            container->bufferCount -= 1;
+            container->buffers[i] = container->buffers[container->bufferCount];
+            continue; // re-examine the swapped-in entry
+        }
+        i += 1;
+    }
+}
+
 // This function assumes that it's called from within an autorelease pool
 static MetalTexture *METAL_INTERNAL_PrepareTextureForWrite(
     MetalRenderer *renderer,
@@ -1665,6 +1713,7 @@ static MetalTexture *METAL_INTERNAL_PrepareTextureForWrite(
         for (i = 0; i < container->textureCount; i += 1) {
             if (SDL_GetAtomicInt(&container->textures[i]->referenceCount) == 0) {
                 container->activeTexture = container->textures[i];
+                METAL_INTERNAL_TrimCycledTextures(container, container->activeTexture);
                 return container->activeTexture;
             }
         }
@@ -1829,6 +1878,7 @@ static MetalBuffer *METAL_INTERNAL_PrepareBufferForWrite(
         for (i = 0; i < container->bufferCount; i += 1) {
             if (SDL_GetAtomicInt(&container->buffers[i]->referenceCount) == 0) {
                 container->activeBuffer = container->buffers[i];
+                METAL_INTERNAL_TrimCycledBuffers(container, container->activeBuffer);
                 return container->activeBuffer;
             }
         }
