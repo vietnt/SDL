@@ -1288,6 +1288,7 @@ struct VulkanRenderer
     SDL_Mutex *windowLock;
 
     Uint8 defragInProgress;
+    SDL_AtomicInt recordingCommandBufferCount;
 
     VulkanMemoryAllocation **allocationsToDefrag;
     Uint32 allocationsToDefragCount;
@@ -9878,6 +9879,7 @@ static SDL_GPUCommandBuffer *VULKAN_AcquireCommandBuffer(
     if (!VULKAN_INTERNAL_BeginCommandBuffer(renderer, commandBuffer)) {
         return NULL;
     }
+    SDL_AtomicIncRef(&renderer->recordingCommandBufferCount);
 
     return (SDL_GPUCommandBuffer *)commandBuffer;
 }
@@ -11223,6 +11225,7 @@ static bool VULKAN_Submit(
         (renderer->claimedWindowCount > 0 && vulkanCommandBuffer->swapchainRequested) ||
         renderer->claimedWindowCount == 0;
 
+    (void)SDL_AtomicDecRef(&renderer->recordingCommandBufferCount);
     SDL_LockMutex(renderer->submitLock);
 
     // FIXME: Can this just be permanent?
@@ -11244,9 +11247,13 @@ static bool VULKAN_Submit(
             swapchainTextureSubresource);
     }
 
+    /* Defragmenting moves resources to new memory. A command buffer still being
+     * recorded holds the old memory, and its commands would land there after the
+     * contents were copied, so wait until no other command buffer is recording. */
     if (performCleanups &&
         renderer->allocationsToDefragCount > 0 &&
-        !renderer->defragInProgress) {
+        !renderer->defragInProgress &&
+        SDL_GetAtomicInt(&renderer->recordingCommandBufferCount) == 0) {
         if (!VULKAN_INTERNAL_DefragmentMemory(renderer, vulkanCommandBuffer))
         {
             SDL_LogError(SDL_LOG_CATEGORY_GPU, "%s", "Failed to defragment memory, likely OOM!");
@@ -11423,6 +11430,7 @@ static bool VULKAN_Cancel(
 
     vulkanCommandBuffer = (VulkanCommandBuffer *)commandBuffer;
     renderer = vulkanCommandBuffer->renderer;
+    (void)SDL_AtomicDecRef(&renderer->recordingCommandBufferCount);
 
     VULKAN_INTERNAL_AbortTimingForCommandBuffer(renderer, vulkanCommandBuffer);
 
