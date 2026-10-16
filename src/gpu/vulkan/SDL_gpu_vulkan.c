@@ -5170,6 +5170,11 @@ static void VULKAN_DestroyDevice(
     }
     SDL_free(renderer->descriptorSetCachePool);
 
+    // Timing samples hold fences; they go back to the pool before it goes.
+    for (Uint32 i = 0; i < renderer->timingSampleCount; i += 1) {
+        VULKAN_INTERNAL_ReleaseTimingSampleResources(renderer, &renderer->timingSamples[i]);
+    }
+
     for (Uint32 i = 0; i < renderer->fencePool.availableFenceCount; i += 1) {
         renderer->vkDestroyFence(
             renderer->logicalDevice,
@@ -5182,9 +5187,6 @@ static void VULKAN_DestroyDevice(
     SDL_free(renderer->fencePool.availableFences);
     SDL_DestroyMutex(renderer->fencePool.lock);
 
-    for (Uint32 i = 0; i < renderer->timingSampleCount; i += 1) {
-        VULKAN_INTERNAL_ReleaseTimingSampleResources(renderer, &renderer->timingSamples[i]);
-    }
     renderer->timingSampleCount = 0;
     SDL_free(renderer->timingSamples);
     renderer->timingSamples = NULL;
