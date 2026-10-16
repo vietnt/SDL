@@ -411,6 +411,22 @@ extern "C" {
 typedef struct SDL_GPUDevice SDL_GPUDevice;
 
 /**
+ * GPU memory architecture and amount information.
+ *
+ * `architecture` is 0 when unknown, 1 for unified memory, and 2 for dedicated
+ * memory. `kind` is 0 when no amount is available, 1 for a budget, and 2 for
+ * a capacity.
+ *
+ * \since This struct is available in the Moonbase SDL fork.
+ */
+typedef struct SDL_GPUMemoryInfo
+{
+    Uint32 architecture;
+    Uint32 kind;
+    Uint64 bytes;
+} SDL_GPUMemoryInfo;
+
+/**
  * An opaque handle representing a buffer.
  *
  * Used for vertices, indices, indirect draw commands, and general compute
@@ -2605,6 +2621,19 @@ extern SDL_DECLSPEC SDL_GPUShaderFormat SDLCALL SDL_GetGPUShaderFormats(SDL_GPUD
  * \since This function is available since SDL 3.4.0.
  */
 extern SDL_DECLSPEC SDL_PropertiesID SDLCALL SDL_GetGPUDeviceProperties(SDL_GPUDevice *device);
+
+/**
+ * Query the memory architecture and available memory amount for a GPU context.
+ *
+ * \param device a GPU context to query.
+ * \param info the structure filled with memory information.
+ * \returns true when any memory information is available, or false otherwise.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available in the Moonbase SDL fork.
+ */
+extern SDL_DECLSPEC bool SDLCALL SDL_GetGPUMemoryInfo(SDL_GPUDevice *device, SDL_GPUMemoryInfo *info);
 
 /**
  * Get the underlying Metal device for a GPU context.

@@ -154,6 +154,7 @@ static const IID D3D_IID_IDXGIAdapter1 = { 0x29038f61, 0x3839, 0x4626, { 0x91, 0
 #if (defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES))
 static const IID D3D_IID_IDXGIDevice1 = { 0x77db970f, 0x6276, 0x48ba, { 0xba, 0x28, 0x07, 0x01, 0x43, 0xb4, 0x39, 0x2c } };
 #else
+static const IID D3D_IID_IDXGIAdapter3 = { 0x645967a4, 0x1392, 0x4310, { 0xa7, 0x98, 0x80, 0x53, 0xce, 0x3e, 0x93, 0xfd } };
 static const IID D3D_IID_IDXGIDevice = { 0x54ec77fa, 0x1377, 0x44e6, { 0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c } };
 #endif
 static const IID D3D_IID_IDXGISwapChain3 = { 0x94d99bdb, 0xf1f8, 0x4ab0, { 0xb2, 0x36, 0x7d, 0xa0, 0x17, 0x0e, 0xda, 0xb1 } };
@@ -1973,6 +1974,32 @@ static SDL_PropertiesID D3D12_GetDeviceProperties(SDL_GPUDevice *device)
 {
     D3D12Renderer *renderer = (D3D12Renderer *)device->driverData;
     return renderer->props;
+}
+
+static bool D3D12_GetMemoryInfo(SDL_GPURenderer *driverData, SDL_GPUMemoryInfo *info)
+{
+    D3D12Renderer *renderer = (D3D12Renderer *)driverData;
+
+    info->architecture = renderer->UMA ? 1 : 2;
+
+#if !(defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES))
+    IDXGIAdapter3 *adapter3 = NULL;
+    HRESULT result = IDXGIAdapter1_QueryInterface(
+        renderer->adapter,
+        D3D_GUID(D3D_IID_IDXGIAdapter3),
+        (void **)&adapter3);
+    if (SUCCEEDED(result)) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO memoryInfo;
+        result = IDXGIAdapter3_QueryVideoMemoryInfo(adapter3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memoryInfo);
+        IDXGIAdapter3_Release(adapter3);
+        if (SUCCEEDED(result)) {
+            info->kind = 1;
+            info->bytes = memoryInfo.Budget;
+        }
+    }
+#endif
+
+    return true;
 }
 
 // Barriers

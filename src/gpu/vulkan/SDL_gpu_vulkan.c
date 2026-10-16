@@ -5266,6 +5266,30 @@ static SDL_PropertiesID VULKAN_GetDeviceProperties(
     return renderer->props;
 }
 
+static bool VULKAN_GetMemoryInfo(SDL_GPURenderer *driverData, SDL_GPUMemoryInfo *info)
+{
+    VulkanRenderer *renderer = (VulkanRenderer *)driverData;
+    VkPhysicalDeviceType deviceType = renderer->physicalDeviceProperties.properties.deviceType;
+
+    if (deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+        info->architecture = 1;
+    } else if (deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+        info->architecture = 2;
+    }
+
+    for (Uint32 i = 0; i < renderer->memoryProperties.memoryHeapCount; i += 1) {
+        const VkMemoryHeap *heap = &renderer->memoryProperties.memoryHeaps[i];
+        if (heap->flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            info->bytes += heap->size;
+        }
+    }
+
+    if (info->bytes > 0) {
+        info->kind = 2;
+    }
+    return info->architecture != 0 || info->kind != 0;
+}
+
 static DescriptorSetCache *VULKAN_INTERNAL_AcquireDescriptorSetCache(
     VulkanRenderer *renderer)
 {

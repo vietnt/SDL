@@ -872,6 +872,13 @@ static SDL_PropertiesID METAL_GetDeviceProperties(SDL_GPUDevice *device)
     return renderer->props;
 }
 
+static bool METAL_GetMemoryInfo(SDL_GPURenderer *driverData, SDL_GPUMemoryInfo *info)
+{
+    (void)driverData;
+    (void)info;
+    return false;
+}
+
 // Resource tracking
 
 static void METAL_INTERNAL_TrackBuffer(

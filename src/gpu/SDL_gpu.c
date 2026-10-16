@@ -796,6 +796,17 @@ SDL_PropertiesID SDL_GetGPUDeviceProperties(SDL_GPUDevice *device)
     return device->GetDeviceProperties(device);
 }
 
+bool SDL_GetGPUMemoryInfo(SDL_GPUDevice *device, SDL_GPUMemoryInfo *info)
+{
+    CHECK_PARAM(info == NULL) {
+        return SDL_InvalidParamError("info");
+    }
+
+    SDL_zero(*info);
+    CHECK_DEVICE_MAGIC(device, false);
+    return device->GetMemoryInfo(device->driverData, info);
+}
+
 void * SDL_GetGPUMetalDevice(SDL_GPUDevice *device)
 {
     CHECK_DEVICE_MAGIC(device, NULL);

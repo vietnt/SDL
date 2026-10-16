@@ -673,6 +673,8 @@ struct SDL_GPUDevice
 
     SDL_PropertiesID (*GetDeviceProperties)(SDL_GPUDevice *device);
 
+    bool (*GetMemoryInfo)(SDL_GPURenderer *driverData, SDL_GPUMemoryInfo *info);
+
     void *(*GetMetalDevice)(
         SDL_GPURenderer *driverData);
 
@@ -1156,6 +1158,7 @@ struct SDL_GPUDevice
 #define ASSIGN_DRIVER(name)                                 \
     ASSIGN_DRIVER_FUNC(DestroyDevice, name)                 \
     ASSIGN_DRIVER_FUNC(GetDeviceProperties, name)      \
+    ASSIGN_DRIVER_FUNC(GetMemoryInfo, name)            \
     ASSIGN_DRIVER_FUNC(GetMetalDevice, name)                \
     ASSIGN_DRIVER_FUNC(GetMetalCommandBuffer, name)         \
     ASSIGN_DRIVER_FUNC(GetMetalTexture, name)               \
