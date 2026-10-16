@@ -621,7 +621,6 @@ typedef struct MetalCommandBuffer
 
     // Fences
     MetalFence *fence;
-    bool autoReleaseFence;
 
     // Reference Counting
     MetalBuffer **usedBuffers;
@@ -2359,8 +2358,6 @@ static SDL_GPUCommandBuffer *METAL_AcquireCommandBuffer(
             commandBuffer->computeUniformBuffers[i] = NULL;
         }
 
-        commandBuffer->autoReleaseFence = true;
-
         SDL_UnlockMutex(renderer->acquireCommandBufferLock);
 
         return (SDL_GPUCommandBuffer *)commandBuffer;
@@ -3916,11 +3913,12 @@ static void METAL_INTERNAL_CleanCommandBuffer(
     commandBuffer->needComputeReadOnlyStorageTextureBind = false;
     SDL_zeroa(commandBuffer->needComputeUniformBufferBind);
 
-    // The fence is now available (unless SubmitAndAcquireFence was called)
-    if (commandBuffer->autoReleaseFence) {
+    // Drop the command buffer's own reference to its fence
+    if (commandBuffer->fence) {
         METAL_ReleaseFence(
             (SDL_GPURenderer *)renderer,
             (SDL_GPUFence *)commandBuffer->fence);
+        commandBuffer->fence = NULL;
     }
 
     // Return command buffer to pool
@@ -4464,8 +4462,9 @@ static bool METAL_SetAllowedFramesInFlight(
 
 // Submission
 
-static bool METAL_Submit(
-    SDL_GPUCommandBuffer *commandBuffer)
+static bool METAL_INTERNAL_Submit(
+    SDL_GPUCommandBuffer *commandBuffer,
+    SDL_GPUFence **acquiredFence)
 {
     @autoreleasepool {
         MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
@@ -4547,6 +4546,12 @@ static bool METAL_Submit(
         [metalCommandBuffer->handle commit];
         metalCommandBuffer->handle = nil;
 
+        // The application gets its own reference, taken before any cleanup can see this command buffer
+        if (acquiredFence) {
+            (void)SDL_AtomicIncRef(&metalCommandBuffer->fence->referenceCount);
+            *acquiredFence = (SDL_GPUFence *)metalCommandBuffer->fence;
+        }
+
         // Mark the command buffer as submitted
         if (renderer->submittedCommandBufferCount >= renderer->submittedCommandBufferCapacity) {
             renderer->submittedCommandBufferCapacity = renderer->submittedCommandBufferCount + 1;
@@ -4576,15 +4581,20 @@ static bool METAL_Submit(
     }
 }
 
+static bool METAL_Submit(
+    SDL_GPUCommandBuffer *commandBuffer)
+{
+    return METAL_INTERNAL_Submit(commandBuffer, NULL);
+}
+
 static SDL_GPUFence *METAL_SubmitAndAcquireFence(
     SDL_GPUCommandBuffer *commandBuffer)
 {
-    MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
-    metalCommandBuffer->autoReleaseFence = false;
-    if (!METAL_Submit(commandBuffer)) {
+    SDL_GPUFence *fence = NULL;
+    if (!METAL_INTERNAL_Submit(commandBuffer, &fence)) {
         return NULL;
     }
-    return (SDL_GPUFence *)metalCommandBuffer->fence;
+    return fence;
 }
 
 static bool METAL_Cancel(
@@ -4595,7 +4605,6 @@ static bool METAL_Cancel(
 
     METAL_INTERNAL_AbortTimingForCommandBuffer(renderer, metalCommandBuffer);
 
-    metalCommandBuffer->autoReleaseFence = false;
     SDL_LockMutex(renderer->submitLock);
     METAL_INTERNAL_CleanCommandBuffer(renderer, metalCommandBuffer, true);
     SDL_UnlockMutex(renderer->submitLock);
