@@ -14,7 +14,8 @@ goose_gfx need on top of it:
   defragmentation while another command buffer records
   (`test/testgpu_defrag_recording.c`), and a fence released after a query
   no longer leaking its command buffer on Vulkan and Direct3D 12
-  (`test/testgpu_fence_release.c`);
+  (`test/testgpu_fence_release.c`), and Metal texture uploads keeping to
+  `pixels_per_row` and `rows_per_layer` (`test/testgpu_upload_pitch.c`);
 - a fix for the fork's own timing code: destroying a Vulkan device with
   timings not yet polled no longer corrupts the heap
   (`test/testgpu_timing_destroy.c`).

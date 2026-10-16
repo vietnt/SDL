@@ -1987,14 +1987,17 @@ static void METAL_UploadToTexture(
         MetalBufferContainer *bufferContainer = (MetalBufferContainer *)source->transfer_buffer;
         MetalTextureContainer *textureContainer = (MetalTextureContainer *)destination->texture;
 
+        Uint32 pixelsPerRow = source->pixels_per_row ? source->pixels_per_row : destination->w;
+        Uint32 rowsPerLayer = source->rows_per_layer ? source->rows_per_layer : destination->h;
+
         MetalTexture *metalTexture = METAL_INTERNAL_PrepareTextureForWrite(renderer, textureContainer, cycle);
 
         [metalCommandBuffer->blitEncoder
                  copyFromBuffer:bufferContainer->activeBuffer->handle
                    sourceOffset:source->offset
-              sourceBytesPerRow:BytesPerRow(destination->w, textureContainer->header.info.format)
+              sourceBytesPerRow:BytesPerRow(pixelsPerRow, textureContainer->header.info.format)
             // sourceBytesPerImage expects the stride between 2D images (slices) of a 3D texture, not the size of the entire region
-            sourceBytesPerImage:SDL_CalculateGPUTextureFormatSize(textureContainer->header.info.format, destination->w, destination->h, 1)
+            sourceBytesPerImage:SDL_CalculateGPUTextureFormatSize(textureContainer->header.info.format, pixelsPerRow, rowsPerLayer, 1)
                      sourceSize:MTLSizeMake(destination->w, destination->h, destination->d)
                       toTexture:metalTexture->handle
                destinationSlice:destination->layer
