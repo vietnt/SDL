@@ -12,9 +12,10 @@
 
 /* SDL_GetGPUMemoryInfo must report what the backend knows. On every driver
    the fields hold one of their documented values and an amount comes with
-   its kind. Metal always knows: unified memory, with its recommended working
-   set as the budget, which can't exceed system memory. Vulkan reports its
-   device-local heaps as a capacity. */
+   its kind. Metal reports unified memory on Apple silicon and dedicated
+   memory on a discrete GPU, with its recommended working set as the budget,
+   which unified memory can't exceed. Vulkan reports its device-local heaps
+   as a capacity. */
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -61,8 +62,14 @@ int main(int argc, char *argv[])
         pass = false;
     }
     if (SDL_strcmp(driver, "metal") == 0) {
-        if (info.architecture != 1 || info.kind != 1 || info.bytes == 0 || info.bytes > system_bytes) {
-            SDL_Log("FAIL: Metal should report unified memory with a budget no larger than system memory");
+#if defined(__aarch64__) || defined(__arm64__)
+        const bool architecture_ok = info.architecture == 1;
+#else
+        const bool architecture_ok = info.architecture == 1 || info.architecture == 2;
+#endif
+        if (!architecture_ok || info.kind != 1 || info.bytes == 0 ||
+            (info.architecture == 1 && info.bytes > system_bytes)) {
+            SDL_Log("FAIL: Metal should report its architecture (unified on Apple silicon) and a budget, no larger than system memory when unified");
             pass = false;
         }
     } else if (SDL_strcmp(driver, "vulkan") == 0) {

@@ -876,17 +876,20 @@ static bool METAL_GetMemoryInfo(SDL_GPURenderer *driverData, SDL_GPUMemoryInfo *
 {
     MetalRenderer *renderer = (MetalRenderer *)driverData;
 
-    // Reported as unified memory, as on Apple silicon. The budget is the
-    // working set Metal recommends, how much the GPU can use before
-    // performance suffers.
-    info->architecture = 1;
+    // Unified on Apple silicon, dedicated on a Mac's discrete GPU. Either
+    // way the budget is the working set Metal recommends, how much the GPU
+    // can use before performance suffers; Metal has no query for a
+    // discrete GPU's total VRAM.
+    if (@available(macOS 10.15, iOS 13.0, tvOS 13.0, *)) {
+        info->architecture = renderer->device.hasUnifiedMemory ? 1 : 2;
+    }
     if (@available(macOS 10.12, iOS 16.0, tvOS 16.0, *)) {
         info->bytes = renderer->device.recommendedMaxWorkingSetSize;
         if (info->bytes > 0) {
             info->kind = 1;
         }
     }
-    return true;
+    return info->architecture != 0 || info->kind != 0;
 }
 
 // Resource tracking

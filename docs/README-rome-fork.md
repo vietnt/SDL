@@ -8,8 +8,8 @@ goose_gfx need on top of it:
   backend handles and interop contract, and bounded Metal cycled pools;
 - `SDL_GetGPUMemoryInfo` and the corrected `ID3D12QueryHeap` IID, which Rome
   used to apply as build-time patches. Unlike Rome's patch, Metal reports
-  unified memory with its recommended working set as the budget
-  (`test/testgpu_memory_info.c`);
+  unified or dedicated memory, from the device, with its recommended working
+  set as the budget (`test/testgpu_memory_info.c`);
 - fixes for SDL bugs that upstream does not have yet: no Vulkan
   defragmentation while another command buffer records
   (`test/testgpu_defrag_recording.c`), and a fence released after a query
