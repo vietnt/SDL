@@ -47,6 +47,7 @@
 
 - (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection;
 
+- (void)setDisplayLinkPaused:(BOOL)paused;
 - (void)setAnimationCallback:(int)interval
                     callback:(void (*)(void *))callback
                callbackParam:(void *)callbackParam;

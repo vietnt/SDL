@@ -1275,6 +1275,24 @@ extern "C" {
 #define SDL_HINT_IOS_HIDE_HOME_INDICATOR "SDL_IOS_HIDE_HOME_INDICATOR"
 
 /**
+ * A variable pausing the display link a window keeps on a display faster
+ * than 60 Hz (iOS 15 and later), which asks the display for its full rate
+ * and wakes the main thread at every refresh.
+ *
+ * The variable can be set to the following values:
+ *
+ * - "0": The display link runs. (default)
+ * - "1": The display link is paused: the display may drop to a low rate and
+ *   the main thread is not woken, for a program whose screen holds still.
+ *   An animation callback (SDL_SetiOSAnimationCallback) is paused with it.
+ *
+ * This hint can be set anytime, from the main thread.
+ *
+ * \since This hint is available in the rome fork of SDL 3.4.
+ */
+#define SDL_HINT_IOS_DISPLAY_LINK_PAUSED "SDL_IOS_DISPLAY_LINK_PAUSED"
+
+/**
  * A variable that lets you enable joystick (and gamecontroller) events even
  * when your app is in the background.
  *

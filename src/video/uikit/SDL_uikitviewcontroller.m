@@ -24,6 +24,7 @@
 
 #include "../SDL_sysvideo.h"
 #include "../../events/SDL_events_c.h"
+#include "../../SDL_hints_c.h"
 
 #include "SDL_uikitviewcontroller.h"
 #include "SDL_uikitmessagebox.h"
@@ -54,6 +55,14 @@ static void SDLCALL SDL_HideHomeIndicatorHintChanged(void *userdata, const char 
     }
 }
 #endif
+
+static void SDLCALL SDL_DisplayLinkPausedHintChanged(void *userdata, const char *name, const char *oldValue, const char *hint)
+{
+    @autoreleasepool {
+        SDL_uikitviewcontroller *viewcontroller = (__bridge SDL_uikitviewcontroller *)userdata;
+        [viewcontroller setDisplayLinkPaused:SDL_GetStringBoolean(hint, false)];
+    }
+}
 
 @implementation SDLUITextField : UITextField
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender
@@ -118,6 +127,9 @@ static void SDLCALL SDL_HideHomeIndicatorHintChanged(void *userdata, const char 
                 [displayLink addToRunLoop:NSRunLoop.currentRunLoop forMode:NSDefaultRunLoopMode];
             }
         }
+        SDL_AddHintCallback(SDL_HINT_IOS_DISPLAY_LINK_PAUSED,
+                            SDL_DisplayLinkPausedHintChanged,
+                            (__bridge void *)self);
     }
     return self;
 }
@@ -134,6 +146,9 @@ static void SDLCALL SDL_HideHomeIndicatorHintChanged(void *userdata, const char 
                         (__bridge void *)self);
 #endif
 
+    SDL_RemoveHintCallback(SDL_HINT_IOS_DISPLAY_LINK_PAUSED,
+                           SDL_DisplayLinkPausedHintChanged,
+                           (__bridge void *)self);
 #ifndef SDL_PLATFORM_TVOS
     SDL_RemoveHintCallback(SDL_HINT_IOS_HIDE_HOME_INDICATOR,
                         SDL_HideHomeIndicatorHintChanged,
@@ -164,9 +179,15 @@ static void SDLCALL SDL_HideHomeIndicatorHintChanged(void *userdata, const char 
     }
 }
 
+- (void)setDisplayLinkPaused:(BOOL)paused
+{
+    displayLink.paused = paused;
+}
+
 - (void)startAnimation
 {
     displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(doLoop:)];
+    displayLink.paused = SDL_GetHintBoolean(SDL_HINT_IOS_DISPLAY_LINK_PAUSED, false);
 
 #ifdef SDL_PLATFORM_VISIONOS
     displayLink.preferredFramesPerSecond = 90 / animationInterval;      //TODO: Get frame max frame rate on visionOS
