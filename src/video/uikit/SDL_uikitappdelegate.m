@@ -339,6 +339,30 @@ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
 @end // SDLLaunchScreenController
 
 
+// Whether we've started the application main function, which should only happen once
+static bool SDL_main_started;
+
+// Return whether a scene is for an external display, which shouldn't run the application
+static bool UIKit_IsExternalDisplayScene(UIScene *scene) API_AVAILABLE(ios(13.0), tvos(13.0));
+static bool UIKit_IsExternalDisplayScene(UIScene *scene)
+{
+#if !defined(SDL_PLATFORM_TVOS) && !defined(SDL_PLATFORM_VISIONOS)
+    NSString *role = scene.session.role;
+    if (@available(iOS 16.0, *)) {
+        if ([role isEqualToString:UIWindowSceneSessionRoleExternalDisplayNonInteractive]) {
+            return true;
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if ([role isEqualToString:UIWindowSceneSessionRoleExternalDisplay]) {
+        return true;
+    }
+#pragma clang diagnostic pop
+#endif
+    return false;
+}
+
 API_AVAILABLE(ios(13.0))
 @implementation SDLUIKitSceneDelegate
 {
@@ -354,6 +378,50 @@ API_AVAILABLE(ios(13.0))
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions
 {
     if (![scene isKindOfClass:[UIWindowScene class]]) {
+        return;
+    }
+
+    NSLog(@"SDL scene: connecting, role %@, main %s", session.role, SDL_main_started ? "already started" : "not started");
+
+    if (UIKit_IsExternalDisplayScene(scene)) {
+        // Leave external display scenes alone, so the system can mirror the display
+        return;
+    }
+
+    if (SDL_main_started) {
+        /* An application scene connecting again (after the system disconnected the old one in the
+           background, or a session restored at launch): main keeps running, and its windows move
+           to this scene so their picture comes back. Never destroy a session here: the scene that
+           main's window is in may be any of them. */
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        windowScene.delegate = self;
+        SDL_VideoDevice *video = SDL_GetVideoDevice();
+        for (SDL_Window *window = video ? video->windows : NULL; window; window = window->next) {
+            SDL_UIKitWindowData *data = (__bridge SDL_UIKitWindowData *)window->internal;
+            UIWindowScene *old = data.uiwindow.windowScene;
+            if (!data.uiwindow || old == windowScene) {
+                continue;
+            }
+            if (old && [[UIApplication sharedApplication].connectedScenes containsObject:old] &&
+                old.activationState != UISceneActivationStateBackground &&
+                old.activationState != UISceneActivationStateUnattached) {
+                continue;
+            }
+            data.uiwindow.windowScene = windowScene;
+            if (!(window->flags & SDL_WINDOW_HIDDEN)) {
+                [data.uiwindow makeKeyAndVisible];
+            }
+            NSLog(@"SDL scene: window moved to the new %@ scene", session.role);
+        }
+        // and any URLs passed in
+        for (NSUserActivity *activity in connectionOptions.userActivities) {
+            if (activity.webpageURL) {
+                [self handleURL:activity.webpageURL];
+            }
+        }
+        for (UIOpenURLContext *urlContext in connectionOptions.URLContexts) {
+            [self handleURL:urlContext.URL];
+        }
         return;
     }
 
@@ -416,6 +484,7 @@ API_AVAILABLE(ios(13.0))
     }
 
     SDL_SetMainReady();
+    SDL_main_started = true;
     [self performSelector:@selector(postFinishLaunch) withObject:nil afterDelay:0.0];
 }
 
@@ -428,21 +497,33 @@ API_AVAILABLE(ios(13.0))
 
 - (void)sceneDidBecomeActive:(UIScene *)scene
 {
+    if (UIKit_IsExternalDisplayScene(scene)) {
+        return;
+    }
     SDL_OnApplicationDidEnterForeground();
 }
 
 - (void)sceneWillResignActive:(UIScene *)scene
 {
+    if (UIKit_IsExternalDisplayScene(scene)) {
+        return;
+    }
     SDL_OnApplicationWillEnterBackground();
 }
 
 - (void)sceneWillEnterForeground:(UIScene *)scene
 {
+    if (UIKit_IsExternalDisplayScene(scene)) {
+        return;
+    }
     SDL_OnApplicationWillEnterForeground();
 }
 
 - (void)sceneDidEnterBackground:(UIScene *)scene
 {
+    if (UIKit_IsExternalDisplayScene(scene)) {
+        return;
+    }
     SDL_OnApplicationDidEnterBackground();
 }
 
