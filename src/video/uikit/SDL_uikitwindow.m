@@ -380,8 +380,7 @@ void UIKit_GetWindowSizeInPixels(SDL_VideoDevice *_this, SDL_Window *window, int
 
         if (window->flags & SDL_WINDOW_HIGH_PIXEL_DENSITY) {
 #ifndef SDL_PLATFORM_VISIONOS
-            // The screen's scale, not nativeScale: as UIKit_Metal_CreateView's (points x scale)
-            scale = windata.uiwindow.screen.scale;
+            scale = windata.uiwindow.screen.nativeScale;
 #else
             scale = 2.0;
 #endif
