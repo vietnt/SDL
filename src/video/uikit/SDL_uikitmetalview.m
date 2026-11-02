@@ -87,13 +87,16 @@ SDL_MetalView UIKit_Metal_CreateView(SDL_VideoDevice *_this, SDL_Window *window)
         SDL_uikitmetalview *metalview;
 
         if (window->flags & SDL_WINDOW_HIGH_PIXEL_DENSITY) {
-            /* Set the scale to the natural scale factor of the screen - then
-             * the backing dimensions of the Metal view will match the pixel
-             * dimensions of the screen rather than the dimensions in points
-             * yielding high resolution on retine displays.
+            /* Set the scale to the screen's scale factor (points x scale, as
+             * UIKit renders): high resolution on retina displays, and one
+             * scale on both displays of a foldable iPhone, where nativeScale
+             * differs (about 2.81 inside, 3 outside) and contentsScale, set
+             * once here, would go stale across a fold. iOS scales the
+             * drawable to the panel where its pixels differ (Plus and mini
+             * models, Display Zoom).
              */
 #ifndef SDL_PLATFORM_VISIONOS
-            scale = data.uiwindow.screen.nativeScale;
+            scale = data.uiwindow.screen.scale;
 #else
             // VisionOS doesn't use the concept of "nativeScale" like other iOS devices.
             // We use a fixed scale factor of 2.0 to achieve better pixel density.
